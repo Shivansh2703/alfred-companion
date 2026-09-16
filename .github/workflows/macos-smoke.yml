@@ -1,0 +1,203 @@
+name: macos-smoke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-smoke:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run exported unit tests (companion_core, webui, mac_app — must all pass on macOS)
+        shell: bash
+        run: python3 -m unittest tests.test_companion_core tests.test_webui tests.test_mac_app -v
+
+      - name: Stage fake Steam install + exchange dir under a temp HOME
+        shell: bash
+        run: |
+          home="$RUNNER_TEMP/home"
+          mkdir -p "$home/Library/Application Support/Steam/userdata/123456/1142710/local/Warhammer3/scripts"
+          steam="$home/Library/Application Support/Steam"
+          mkdir -p "$steam/steamapps"
+          build_id=$(python3 -c "import json; print(json.load(open('vanilla.lock.json'))['game_build_id'])")
+          printf '"AppState"\n{\n    "appid"        "1142710"\n    "buildid"        "%s"\n}\n' "$build_id" \
+            > "$steam/steamapps/appmanifest_1142710.acf"
+          : > "$steam/steamapps/libraryfolders.vdf"
+          echo "HOME=$home" >> "$GITHUB_ENV"
+
+      - name: Start companion, wait for webui.json, GET/POST smoke (one step)
+        shell: bash
+        run: |
+          # One step, like windows-smoke.yml: keeps spawn+wait+curl+kill inside one shell
+          # process so nothing can be reaped at a step boundary.
+          mkdir -p "$HOME/Library/Application Support/Alfred"
+          # No rules.json in this public repo (release-only, ~16MB, see README) — the
+          # companion boots without a rulebook and the web UI still answers; the marker
+          # below makes a bare checkout behave like a packaged install (paths.py only
+          # points at ~/Library/Application Support/Alfred when this file is present).
+          cat > alfred.companion.json <<JSON
+          {"schema_version":1,"preset":"vanilla","platform":"mac"}
+          JSON
+          mkdir -p .cache
+          printf 'vanilla' > .cache/profile
+          log="$RUNNER_TEMP/companion.log"
+          python3 -u daemon/aigen.py --companion >"$log" 2>&1 &
+          companion_pid=$!
+          echo "COMPANION_PID=$companion_pid" >> "$GITHUB_ENV"
+
+          info="$HOME/Library/Application Support/Alfred/webui.json"
+          deadline=$((SECONDS + 60))
+          while [ ! -f "$info" ] && [ $SECONDS -lt $deadline ]; do sleep 1; done
+
+          echo "== ps -p $companion_pid =="
+          ps -p "$companion_pid" || echo "process is NOT running"
+
+          if [ ! -f "$info" ]; then
+            echo "== companion.log =="
+            cat "$log" || true
+            echo "webui.json never appeared within 60s" >&2
+            exit 1
+          fi
+          port=$(python3 -c "import json; print(json.load(open('$info'))['port'])")
+          echo "WEBUI_PORT=$port" >> "$GITHUB_ENV"
+
+          code=$(curl -s -o /tmp/get_body.txt -w '%{http_code}' "http://127.0.0.1:$port/")
+          if [ "$code" != "200" ]; then echo "GET / returned $code" >&2; exit 1; fi
+          cat /tmp/get_body.txt
+
+          code2=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$port/setup" \
+            -d "provider=gemini" -d "model=x")
+          if [ "$code2" != "403" ]; then echo "POST /setup without token returned $code2" >&2; exit 1; fi
+
+      - name: Print companion log tail (must be plain words, not a traceback)
+        if: always()
+        shell: bash
+        run: |
+          echo "== companion.log tail =="
+          tail -n 40 "$RUNNER_TEMP/companion.log" 2>/dev/null || true
+
+      - name: Stop companion
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${COMPANION_PID:-}" ]; then kill "$COMPANION_PID" 2>/dev/null || true; fi
+
+      - name: Build the real Alfred.app bundle
+        shell: bash
+        run: |
+          # data/rules.json (~16MB, derived game data) is deliberately not in this repo — it
+          # ships only inside release zips (see README "Releasing"). scripts/build_macos_app.sh
+          # only checks the file EXISTS before staging it; it never reads its contents, and
+          # Alfred --smoke below never loads the rulebook either. A tiny placeholder here,
+          # inside the CI runner's checkout only, is never committed to the repo.
+          mkdir -p data
+          [ -f data/rules.json ] || echo '{}' > data/rules.json
+          bash scripts/build_macos_app.sh
+
+      - name: "Bundle smoke: --smoke exit 0, arch, packaged files present"
+        shell: bash
+        run: |
+          app="dist/mac-app/Alfred.app/Contents/MacOS/Alfred"
+          "$app" --smoke
+          echo "== file $app =="
+          file "$app"
+          file "$app" | grep -q arm64
+          test -f "dist/mac-app/Alfred.app/Contents/Resources/app/starting.html"
+          test -f "dist/mac-app/Alfred.app/Contents/Resources/daemon/webui.py"
+
+      - name: Stage a fake launchctl on PATH
+        shell: bash
+        run: |
+          bin="$RUNNER_TEMP/fakebin"
+          mkdir -p "$bin"
+          cat > "$bin/launchctl" <<'SH'
+          #!/bin/bash
+          echo "$@" >> "$RUNNER_TEMP/launchctl_calls.log"
+          exit 0
+          SH
+          chmod +x "$bin/launchctl"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Stage a fake $BROWSER opener
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/fake_browser.sh" <<'SH'
+          #!/bin/bash
+          echo "$@" >> "$RUNNER_TEMP/browser_calls.log"
+          exit 0
+          SH
+          chmod +x "$RUNNER_TEMP/fake_browser.sh"
+          echo "BROWSER=$RUNNER_TEMP/fake_browser.sh" >> "$GITHUB_ENV"
+
+      - name: Launcher smoke — install (double-click path, no flags)
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/launchctl_calls.log" "$RUNNER_TEMP/browser_calls.log"
+          # app_ok() requires an Applications-rooted path (real or ~/Applications) — a
+          # translocated/Downloads launch is refused and installs nothing, so the built
+          # bundle is copied under $HOME/Applications first, same as a real user drag-install.
+          mkdir -p "$HOME/Applications"
+          cp -R dist/mac-app/Alfred.app "$HOME/Applications/Alfred.app"
+          rm -f "$HOME/Library/Application Support/Alfred/webui.json"
+          "$HOME/Applications/Alfred.app/Contents/MacOS/Alfred"
+
+          plist="$HOME/Library/LaunchAgents/com.alfred.companion.plist"
+          test -f "$plist" || { echo "plist missing after launch" >&2; exit 1; }
+          if plutil -p "$plist" | grep -q KeepAlive; then
+            echo "plist unexpectedly carries KeepAlive" >&2; exit 1
+          fi
+          plutil -p "$plist" | grep -q -- '--companion' || { echo "plist missing --companion arg" >&2; exit 1; }
+
+          calls="$RUNNER_TEMP/launchctl_calls.log"
+          test -f "$calls" || { echo "fake launchctl was never called" >&2; exit 1; }
+          grep -n '^bootout' "$calls" | head -1
+          grep -n '^bootstrap' "$calls" | head -1
+          first=$(grep -m1 -E '^(bootout|bootstrap)' "$calls")
+          [ "${first%% *}" = "bootout" ] || { echo "bootout did not run before bootstrap" >&2; exit 1; }
+
+          # No real companion is started by our fake launchctl (nothing actually execs the
+          # LaunchAgent), so webui.json legitimately never appears — plain_open()'s bounded
+          # wait times out and falls back to the bundled starting.html, same fallback path
+          # test_mac_app.py's PlainOpenWebUI class proves offline. That fallback is still the
+          # opener call we're checking below.
+          opened="$RUNNER_TEMP/browser_calls.log"
+          test -f "$opened" || { echo "opener (\$BROWSER) was never called" >&2; exit 1; }
+          cat "$opened"
+          grep -q "starting.html" "$opened" || { echo "opener was not pointed at starting.html" >&2; exit 1; }
+
+      - name: Launcher smoke — stop path
+        shell: bash
+        run: |
+          # alfred_app.py's CLI has no --stop flag (only --smoke / --companion / plain_open);
+          # the only stop route is POST /stop on the web page, which needs a running
+          # companion + its token. The install step above never starts a real companion
+          # (fake launchctl records its args and exits, it never execs anything), so there is
+          # no live webui to POST to either. Both stop routes are unreachable in this
+          # headless rig — skipped here, recorded in the run report rather than faked.
+          echo "skipped: no --stop CLI flag exists and no live companion/token to POST /stop against"
+
+      - name: Collect logs for upload
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp "$RUNNER_TEMP/companion.log" artifacts/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/launchctl_calls.log" artifacts/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/browser_calls.log" artifacts/ 2>/dev/null || true
+
+      - name: Upload companion + launcher logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-smoke-logs
+          path: artifacts
+          if-no-files-found: ignore

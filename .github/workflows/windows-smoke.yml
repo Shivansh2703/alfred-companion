@@ -48,6 +48,14 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "$env:APPDATA\Alfred" | Out-Null
+          # daemon/paths.py's data_dir() only points at %APPDATA%\Alfred when
+          # alfred.companion.json marks this as a packaged install (written by
+          # build_windows_package.sh/build_macos_app.sh at release time, not present in a
+          # bare checkout) — write the same marker so the daemon started straight from the
+          # repo behaves like the shipped package instead of falling back to .cache\.
+          Set-Content -Path alfred.companion.json -Value '{"schema_version":1,"preset":"vanilla","platform":"windows"}'
+          New-Item -ItemType Directory -Force -Path .cache | Out-Null
+          Set-Content -Path .cache\profile -Value 'vanilla' -NoNewline
           $log = "$env:APPDATA\companion.log"
           $p = Start-Process -FilePath python -ArgumentList "daemon\aigen.py","--companion" `
               -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
@@ -102,6 +110,12 @@ jobs:
           Copy-Item app\windows\*.py,app\windows\*.vbs $pkg
           Copy-Item daemon\*.py "$pkg\daemon"
           Copy-Item vanilla.lock.json $pkg
+          # Same packaged-install marker as the companion-boot step above — without it the
+          # daemon started by the launcher writes webui.json under $pkg\.cache instead of
+          # %APPDATA%\Alfred, and the launcher's own wait_for_webui() polls the latter.
+          Set-Content -Path "$pkg\alfred.companion.json" -Value '{"schema_version":1,"preset":"vanilla","platform":"windows"}'
+          New-Item -ItemType Directory -Force -Path "$pkg\.cache" | Out-Null
+          Set-Content -Path "$pkg\.cache\profile" -Value 'vanilla' -NoNewline
           # No pythonw.exe ships in this repo (it's embedded at release build time) — use the
           # runner's own python.exe under that name, same idiom alfred_launcher.py expects.
           $pyexe = (Get-Command python).Source
@@ -142,13 +156,21 @@ jobs:
           $stillRunning = tasklist /FI "PID eq $env:LAUNCHED_PID" | Select-String $env:LAUNCHED_PID
           if ($stillRunning) { throw "process $env:LAUNCHED_PID still running after --stop" }
 
+      - name: Collect logs for upload
+        if: always()
+        shell: pwsh
+        run: |
+          # upload-artifact resolves paths under one least-common-ancestor root — the runner's
+          # scattered temp dirs (APPDATA, APPDATA2) don't share one, so copy into the workspace.
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item "$env:APPDATA\companion.log" artifacts\companion.log -ErrorAction SilentlyContinue
+          Copy-Item "$env:APPDATA\companion.log.err" artifacts\companion.log.err -ErrorAction SilentlyContinue
+          Copy-Item "$env:APPDATA2\Alfred\launcher.log" artifacts\launcher.log -ErrorAction SilentlyContinue
+
       - name: Upload companion + launcher logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-smoke-logs
-          path: |
-            ${{ env.APPDATA }}\companion.log
-            ${{ env.APPDATA }}\companion.log.err
-            ${{ env.APPDATA2 }}\Alfred\launcher.log
+          path: artifacts
           if-no-files-found: ignore

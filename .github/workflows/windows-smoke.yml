@@ -1,0 +1,144 @@
+name: windows-smoke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run exported unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Stage fake Steam install + APPDATA exchange dir
+        shell: pwsh
+        run: |
+          $appdata = "$env:RUNNER_TEMP\appdata"
+          New-Item -ItemType Directory -Force -Path "$appdata\The Creative Assembly\Warhammer3\scripts" | Out-Null
+          $steam = "${env:ProgramFiles(x86)}\Steam"
+          New-Item -ItemType Directory -Force -Path "$steam\steamapps" | Out-Null
+          $buildId = python -c "import json; print(json.load(open('vanilla.lock.json'))['game_build_id'])"
+          $acfLines = '"AppState"', '{', '    "appid"        "1142710"', "    ""buildid""        ""$buildId""", '}'
+          Set-Content -Path "$steam\steamapps\appmanifest_1142710.acf" -Value $acfLines -Encoding ascii
+          New-Item -ItemType File -Force -Path "$steam\steamapps\libraryfolders.vdf" | Out-Null
+          "APPDATA=$appdata" >> $env:GITHUB_ENV
+
+      - name: Start companion (no rules.json in this repo — smoke-only)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:APPDATA\Alfred" | Out-Null
+          $log = "$env:APPDATA\companion.log"
+          $p = Start-Process -FilePath python -ArgumentList "daemon\aigen.py","--companion" `
+              -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
+          "COMPANION_PID=$($p.Id)" >> $env:GITHUB_ENV
+
+      - name: Wait for webui.json
+        shell: pwsh
+        run: |
+          $info = "$env:APPDATA\Alfred\webui.json"
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not (Test-Path $info) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $info)) {
+            Write-Host "== companion.log =="
+            Get-Content "$env:APPDATA\companion.log" -ErrorAction SilentlyContinue
+            Write-Host "== companion.log.err =="
+            Get-Content "$env:APPDATA\companion.log.err" -ErrorAction SilentlyContinue
+            throw "webui.json never appeared within 60s"
+          }
+          $data = Get-Content $info -Raw | ConvertFrom-Json
+          "WEBUI_PORT=$($data.port)" >> $env:GITHUB_ENV
+
+      - name: GET / expects 200 and the status text
+        shell: pwsh
+        run: |
+          $resp = Invoke-WebRequest "http://127.0.0.1:$env:WEBUI_PORT/" -UseBasicParsing
+          if ($resp.StatusCode -ne 200) { throw "GET / returned $($resp.StatusCode)" }
+          Write-Host $resp.Content
+
+      - name: POST /setup without token expects 403
+        shell: pwsh
+        run: |
+          $resp = Invoke-WebRequest "http://127.0.0.1:$env:WEBUI_PORT/setup" -Method POST `
+              -Body @{ provider = "gemini"; model = "x" } -SkipHttpErrorCheck -UseBasicParsing
+          if ($resp.StatusCode -ne 403) { throw "POST /setup without token returned $($resp.StatusCode)" }
+
+      - name: Print companion log tail (must be plain words, not a traceback)
+        if: always()
+        shell: pwsh
+        run: Get-Content "$env:APPDATA\companion.log" -Tail 40 -ErrorAction SilentlyContinue
+
+      - name: Stop companion
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:COMPANION_PID) { Stop-Process -Id $env:COMPANION_PID -Force -ErrorAction SilentlyContinue }
+
+      - name: Stage a Windows package layout for the launcher smoke
+        shell: pwsh
+        run: |
+          $pkg = "$env:RUNNER_TEMP\Alfred"
+          New-Item -ItemType Directory -Force -Path "$pkg\daemon" | Out-Null
+          Copy-Item app\windows\*.py,app\windows\*.vbs $pkg
+          Copy-Item daemon\*.py "$pkg\daemon"
+          Copy-Item vanilla.lock.json $pkg
+          # No pythonw.exe ships in this repo (it's embedded at release build time) — use the
+          # runner's own python.exe under that name, same idiom alfred_launcher.py expects.
+          $pyexe = (Get-Command python).Source
+          Copy-Item $pyexe "$pkg\pythonw.exe"
+          "PKG=$pkg" >> $env:GITHUB_ENV
+
+      - name: Launcher start smoke
+        shell: pwsh
+        run: |
+          $appdata2 = "$env:RUNNER_TEMP\appdata2"
+          New-Item -ItemType Directory -Force -Path $appdata2 | Out-Null
+          $env:APPDATA = $appdata2
+          Push-Location $env:PKG
+          python alfred_launcher.py
+          Pop-Location
+          $startupVbs = "$appdata2\Microsoft\Windows\Start Menu\Programs\Startup\Alfred.vbs"
+          if (-not (Test-Path $startupVbs)) { throw "Startup .vbs missing after launch" }
+          $pidFile = "$appdata2\Alfred\daemon\aigen.pid"
+          if (-not (Test-Path $pidFile)) { throw "pid file missing after launch" }
+          $launchedPid = Get-Content $pidFile
+          $found = tasklist /FI "PID eq $launchedPid"
+          if ($found -notmatch "python") { throw "tasklist does not show python for pid $launchedPid" }
+          if (-not (Test-Path "$appdata2\Alfred\webui.json")) { throw "webui.json missing after launcher start" }
+          "APPDATA2=$appdata2" >> $env:GITHUB_ENV
+          "LAUNCHED_PID=$launchedPid" >> $env:GITHUB_ENV
+
+      - name: Launcher stop smoke
+        shell: pwsh
+        run: |
+          $env:APPDATA = $env:APPDATA2
+          Push-Location $env:PKG
+          python alfred_launcher.py --stop
+          Pop-Location
+          $startupVbs = "$env:APPDATA2\Microsoft\Windows\Start Menu\Programs\Startup\Alfred.vbs"
+          if (Test-Path $startupVbs) { throw "Startup .vbs still present after --stop" }
+          if (Test-Path "$env:APPDATA2\Alfred\daemon\aigen.pid") { throw "pid file still present after --stop" }
+          Start-Sleep -Seconds 2
+          $stillRunning = tasklist /FI "PID eq $env:LAUNCHED_PID" | Select-String $env:LAUNCHED_PID
+          if ($stillRunning) { throw "process $env:LAUNCHED_PID still running after --stop" }
+
+      - name: Upload companion + launcher logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-logs
+          path: |
+            ${{ env.APPDATA }}\companion.log
+            ${{ env.APPDATA }}\companion.log.err
+            ${{ env.APPDATA2 }}\Alfred\launcher.log
+          if-no-files-found: ignore

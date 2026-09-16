@@ -15,8 +15,8 @@ done
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/app" "$STAGE/daemon" "$STAGE/data" "$STAGE/tools" "$STAGE/.cache"
-cp app/alfred_app.py app/alfred.spec "$STAGE/app/"
-cp daemon/aigen.py daemon/paths.py "$STAGE/daemon/"
+cp app/alfred_app.py app/alfred.spec app/starting.html "$STAGE/app/"
+cp daemon/aigen.py daemon/paths.py daemon/webui.py "$STAGE/daemon/"
 cp data/rules.json data/purpose_labels_vanilla.json "$STAGE/data/"
 cp tools/vanilla_preflight.py "$STAGE/tools/"
 cp vanilla.lock.json "$STAGE/vanilla.lock.json"

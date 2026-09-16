@@ -15,8 +15,9 @@ datas = [
     (str(ROOT / ".cache" / "profile"), ".cache"),
     (str(ROOT / "app" / "starting.html"), "app"),
 ]
-a = Analysis([str(ROOT / "app" / "alfred_app.py")], datas=datas, pathex=[str(ROOT)], binaries=[],
-             hiddenimports=["uuid"])
+a = Analysis([str(ROOT / "app" / "alfred_app.py")], datas=datas,
+             pathex=[str(ROOT), str(ROOT / "daemon")], binaries=[],
+             hiddenimports=["uuid", "paths", "aigen", "webui"])
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, exclude_binaries=True, name="Alfred", console=False)
 app = BUNDLE(COLLECT(exe, a.binaries, a.datas, name="Alfred"),

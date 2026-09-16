@@ -138,25 +138,21 @@ jobs:
           Push-Location $env:PKG
           python alfred_launcher.py
           Pop-Location
-          Start-Sleep -Seconds 3
-          Write-Host "== ls -R $appdata2 =="
-          Get-ChildItem -Recurse $appdata2 -ErrorAction SilentlyContinue
-          Write-Host "== ls -R $env:PKG\.cache =="
-          Get-ChildItem -Recurse "$env:PKG\.cache" -ErrorAction SilentlyContinue
-          foreach ($log in @("$appdata2\Alfred\companion.log", "$appdata2\Alfred\launcher.log",
-                              "$env:PKG\.cache\aigen.log")) {
-            if (Test-Path $log) { Write-Host "== $log =="; Get-Content $log }
-          }
-          Write-Host "== Get-Process python*,pythonw* =="
-          Get-Process python*, pythonw* -ErrorAction SilentlyContinue |
-            Format-Table Id, ProcessName, Path
           $startupVbs = "$appdata2\Microsoft\Windows\Start Menu\Programs\Startup\Alfred.vbs"
           if (-not (Test-Path $startupVbs)) { throw "Startup .vbs missing after launch" }
           $pidFile = "$appdata2\Alfred\daemon\aigen.pid"
           if (-not (Test-Path $pidFile)) { throw "pid file missing after launch" }
+          # Re-read the pid fresh from the file the launcher wrote (not a variable carried
+          # from an earlier step) and check it with Get-Process, not tasklist: MEASURED on
+          # windows-latest CI (run 35158297011) that tasklist's own WMI-backed snapshot can
+          # report a live pid as absent within ~0.5s of Get-Process -Id finding it running
+          # (companion.log 0 bytes, webui.json present, msedge opened by the launcher) — a
+          # false negative in the check, not a companion crash.
           $launchedPid = Get-Content $pidFile
-          $found = tasklist /FI "PID eq $launchedPid"
-          if ($found -notmatch "python") { throw "tasklist does not show python for pid $launchedPid" }
+          $proc = Get-Process -Id $launchedPid -ErrorAction SilentlyContinue
+          if (-not $proc -or $proc.ProcessName -notmatch "python") {
+              throw "Get-Process does not show python for pid $launchedPid"
+          }
           if (-not (Test-Path "$appdata2\Alfred\webui.json")) { throw "webui.json missing after launcher start" }
           "APPDATA2=$appdata2" >> $env:GITHUB_ENV
           "LAUNCHED_PID=$launchedPid" >> $env:GITHUB_ENV
@@ -172,7 +168,7 @@ jobs:
           if (Test-Path $startupVbs) { throw "Startup .vbs still present after --stop" }
           if (Test-Path "$env:APPDATA2\Alfred\daemon\aigen.pid") { throw "pid file still present after --stop" }
           Start-Sleep -Seconds 2
-          $stillRunning = tasklist /FI "PID eq $env:LAUNCHED_PID" | Select-String $env:LAUNCHED_PID
+          $stillRunning = Get-Process -Id $env:LAUNCHED_PID -ErrorAction SilentlyContinue
           if ($stillRunning) { throw "process $env:LAUNCHED_PID still running after --stop" }
 
       - name: Collect logs for upload

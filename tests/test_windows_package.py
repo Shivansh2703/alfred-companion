@@ -6,6 +6,7 @@ real Startup folder or a real process.
 """
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -127,6 +128,48 @@ class PidFileAndSingleInstance(unittest.TestCase):
             self.assertTrue(Path(launcher.pid_path(environ)).is_file())
             launcher.stop(environ=environ, runner=lambda *a, **k: None)
             self.assertFalse(Path(launcher.pid_path(environ)).exists())
+
+
+class StartCompanionDetached(unittest.TestCase):
+    """Box 9: without DETACHED_PROCESS the companion dies when the (synchronous)
+    Alfred.vbs launcher exits — MEASURED on windows-latest CI run 35157108916."""
+
+    class _FakePopen:
+        def __init__(self, pid):
+            self.pid = pid
+
+    def _start_and_capture_kwargs(self):
+        calls = []
+
+        def fake_popen(*a, **k):
+            calls.append(k)
+            return self._FakePopen(1)
+
+        with tempfile.TemporaryDirectory() as appdata, tempfile.TemporaryDirectory() as pkg:
+            launcher.start_companion(
+                pkg_dir=pkg, environ={"APPDATA": appdata}, popen=fake_popen)
+        return calls[0]
+
+    def test_win32_passes_detached_flags(self):
+        # DETACHED_PROCESS/CREATE_NEW_PROCESS_GROUP only exist on the real Windows
+        # subprocess module; fake them here since this test runs on any platform.
+        with mock.patch.object(launcher.subprocess, "DETACHED_PROCESS", 0x00000008,
+                                create=True), \
+             mock.patch.object(launcher.subprocess, "CREATE_NEW_PROCESS_GROUP",
+                                0x00000200, create=True):
+            kwargs = self._start_and_capture_kwargs()
+        self.assertEqual(kwargs["creationflags"], 0x00000008 | 0x00000200)
+        self.assertTrue(kwargs["close_fds"])
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_darwin_passes_no_creationflags(self):
+        # On a platform with neither constant (real Mac/Linux), the guarded getattr
+        # falls back to 0 rather than raising AttributeError. Neither constant exists
+        # in this process's subprocess module already (this test IS the Mac case),
+        # so no patching is needed — just confirm the fallback value.
+        self.assertFalse(hasattr(launcher.subprocess, "DETACHED_PROCESS"))
+        kwargs = self._start_and_capture_kwargs()
+        self.assertEqual(kwargs["creationflags"], 0)
 
 
 class TasklistExactPidMatch(unittest.TestCase):

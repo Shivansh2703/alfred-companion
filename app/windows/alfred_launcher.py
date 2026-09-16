@@ -115,11 +115,32 @@ def companion_running(environ=None, alive_check=_tasklist_has_pid):
     return alive_check(pid)
 
 
+def _companion_log_path(environ=None):
+    return os.path.join(data_dir(environ), "companion.log")
+
+
 def start_companion(pkg_dir=None, environ=None, popen=subprocess.Popen):
+    """Launch the companion detached from this launcher process. Without
+    DETACHED_PROCESS the child stays attached to the launcher's console/job and dies
+    the moment the launcher (a synchronous Alfred.vbs Run) exits (MEASURED on
+    windows-latest CI, run 35157108916: daemon writes webui.json then disappears from
+    tasklist). CREATE_NEW_PROCESS_GROUP stops a later Ctrl+Break to this process from
+    reaching the child too. getattr guards both so this module still imports on
+    Mac/Linux for tests. stdin/stdout/stderr are redirected to a log file under the
+    companion's own data dir — a detached, console-less child inheriting the
+    launcher's handles can hang or error on write, and this is where `print()` in
+    aigen.py's --companion loop already goes, so nothing here is newly lost."""
     pkg_dir = pkg_dir or package_dir()
     pythonw = os.path.join(pkg_dir, "pythonw.exe")
     daemon_script = os.path.join(pkg_dir, "daemon", "aigen.py")
-    proc = popen([pythonw, daemon_script, "--companion"], cwd=pkg_dir)
+    log_path = _companion_log_path(environ)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0) |
+             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    with open(log_path, "a", encoding="utf-8") as log:
+        proc = popen([pythonw, daemon_script, "--companion"], cwd=pkg_dir,
+                      creationflags=flags, close_fds=True,
+                      stdin=subprocess.DEVNULL, stdout=log, stderr=log)
     pid_file = pid_path(environ)
     os.makedirs(os.path.dirname(pid_file), exist_ok=True)
     with open(pid_file, "w", encoding="utf-8") as f:

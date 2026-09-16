@@ -831,10 +831,12 @@ def load_rules():
     except RuntimeError as e:
         # Same fail-closed reasoning as the rulebook-missing exit below: running on the wrong
         # prices is worse than not running. A clean message, not a traceback.
-        sys.exit(str(e))
+        # A4: SetupError (not sys.exit/SystemExit) so background mode (_run_companion)
+        # can catch it and wait, instead of the whole companion dying silently.
+        raise SetupError(str(e))
     path = rules_path(profile)
     if not os.path.exists(path) and companion_manifest(ROOT) is not None:
-        sys.exit(f"companion is missing its Vanilla rulebook ({os.path.basename(path)})")
+        raise SetupError(f"companion is missing its Vanilla rulebook ({os.path.basename(path)})")
     if not os.path.exists(path):
         # Build it. A new pack set means a rulebook that has never been extracted, and
         # making the owner run a tool by hand is exactly the per-campaign config this
@@ -847,8 +849,8 @@ def load_rules():
         # FAIL CLOSED. Falling back to vanilla here would be the worst outcome available:
         # Alfred would run confidently on prices that are wrong by up to 2x, and under an
         # overhaul that takes the owner through his own reserve floor without saying so.
-        sys.exit(f"profile {profile!r} selected but {os.path.basename(path)} could not be "
-                 f"built — run: tools/extract_db.py --profile={profile} --fresh")
+        raise SetupError(f"profile {profile!r} selected but {os.path.basename(path)} could not be "
+                          f"built — run: tools/extract_db.py --profile={profile} --fresh")
     r = json.load(open(path))
     global _EFFECT_LABELS
     _EFFECT_LABELS = r.get("effect_labels") or {}

@@ -240,7 +240,8 @@ class AtomicWrites(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = webui._write_info(d, 4242, "tok")
             self.assertFalse(os.path.exists(path + ".tmp"))
-            self.assertEqual(stat_mode_bits(path), 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(stat_mode_bits(path), 0o600)
 
     def test_write_setup_config_leaves_no_tmp_and_is_0600(self):
         with tempfile.TemporaryDirectory() as home:
@@ -255,8 +256,9 @@ class AtomicWrites(unittest.TestCase):
                                            api_key="SECRET")
             self.assertFalse(os.path.exists(cfg_path + ".tmp"))
             self.assertFalse(os.path.exists(cred_path + ".tmp"))
-            self.assertEqual(stat_mode_bits(cfg_path), 0o600)
-            self.assertEqual(stat_mode_bits(cred_path), 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(stat_mode_bits(cfg_path), 0o600)
+                self.assertEqual(stat_mode_bits(cred_path), 0o600)
 
 
 def stat_mode_bits(path):

@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+if sys.platform != "darwin":
+    raise unittest.SkipTest("Mac app")
+
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app" / "alfred_app.py"
 

@@ -229,6 +229,62 @@ class CompanionWaitLoop(unittest.TestCase):
         self.assertEqual(prints, ["same message", "different message"])
 
 
+class CompanionMissingRulebookWaits(unittest.TestCase):
+    """Box 8: load_rules() used to sys.exit() on a missing rulebook. SystemExit is a
+    BaseException, so it escaped _run_companion's `except SetupError`/`except Exception`
+    and killed the background companion instead of waiting. Now it's a SetupError."""
+    def test_packaged_layout_no_rulebook_waits_and_serves_webui(self):
+        aigen._WEBUI_STARTED = False
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as exchange, \
+             tempfile.TemporaryDirectory() as data_dir_path:
+            env = {"HOME": home, "ALFRED_DATA_DIR": data_dir_path}
+            missing_rules = os.path.join(data_dir_path, "rules.json")
+            calls = []
+
+            class _StopLoop(Exception):
+                pass
+
+            def fake_sleep(seconds):
+                calls.append(seconds)
+                if len(calls) >= 3:
+                    raise _StopLoop
+
+            server_holder = {}
+            real_start = aigen.webui.start
+
+            def spying_start(*a, **kw):
+                result = real_start(*a, **kw)
+                server_holder["server"] = result[0]
+                return result
+
+            try:
+                with mock.patch.dict(os.environ, env, clear=True), \
+                     mock.patch.object(aigen, "discover_exchange_dir", return_value=exchange), \
+                     mock.patch.object(aigen, "companion_manifest",
+                                        return_value={"preset": "vanilla"}), \
+                     mock.patch.object(aigen, "_expected_build_id", return_value=None), \
+                     mock.patch.object(aigen, "rules_path", return_value=missing_rules), \
+                     mock.patch.object(aigen.webui, "start", side_effect=spying_start):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        try:
+                            aigen._run_companion(sleep=fake_sleep, wait_seconds=0)
+                        except _StopLoop:
+                            pass
+                        else:
+                            self.fail("companion loop returned instead of waiting")
+            finally:
+                if "server" in server_holder:
+                    server_holder["server"].shutdown()
+                aigen._WEBUI_STARTED = False
+
+            self.assertEqual(calls, [0, 0, 0])
+            self.assertIn("missing its Vanilla rulebook", buf.getvalue())
+            # the web UI must be up before/independent of the wait loop, so the setup
+            # page is reachable while the rulebook problem is still unresolved.
+            self.assertTrue(os.path.exists(os.path.join(data_dir_path, "webui.json")))
+
+
 class SslContextTls(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

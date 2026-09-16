@@ -162,12 +162,12 @@ class StartCompanionDetached(unittest.TestCase):
         self.assertTrue(kwargs["close_fds"])
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
 
+    @unittest.skipIf(sys.platform == "win32", "host subprocess has the Windows constants")
     def test_darwin_passes_no_creationflags(self):
         # On a platform with neither constant (real Mac/Linux), the guarded getattr
         # falls back to 0 rather than raising AttributeError. Neither constant exists
         # in this process's subprocess module already (this test IS the Mac case),
         # so no patching is needed — just confirm the fallback value.
-        self.assertFalse(hasattr(launcher.subprocess, "DETACHED_PROCESS"))
         kwargs = self._start_and_capture_kwargs()
         self.assertEqual(kwargs["creationflags"], 0)
 

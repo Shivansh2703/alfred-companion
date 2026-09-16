@@ -1,0 +1,10 @@
+dist/
+.build-venv/
+.app-stage/
+.win-stage/
+.build-cache/
+.cache/
+alfred.local.json
+alfred-credentials.json
+__pycache__/
+*.pyc

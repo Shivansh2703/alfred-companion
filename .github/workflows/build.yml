@@ -1,0 +1,79 @@
+name: build
+# Builds Alfred-Mac.zip and Alfred-Windows.zip on a version tag, and attaches both to the
+# GitHub release for that tag. Both jobs need data/rules.json, which is not in this repo (it's
+# derived game data, ~16 MB — see README "Releasing"). Simplest honest option: it is fetched
+# from a release asset named rules-<game_build_id>.json already attached to THIS repo, where
+# game_build_id comes from vanilla.lock.json. If that asset does not exist yet, the job fails
+# with a clear message instead of silently shipping a package with no rulebook.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  fetch-rules-check:
+    runs-on: ubuntu-latest
+    outputs:
+      asset_name: ${{ steps.name.outputs.asset_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: name
+        run: |
+          build_id=$(python3 -c "import json;print(json.load(open('vanilla.lock.json'))['game_build_id'])")
+          echo "asset_name=rules-${build_id}.json" >> "$GITHUB_OUTPUT"
+
+  build-mac:
+    needs: fetch-rules-check
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download rules.json release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="${{ needs.fetch-rules-check.outputs.asset_name }}"
+          gh release download --repo "${{ github.repository }}" --pattern "$asset" -O data/rules.json \
+            || { echo "::error::release asset '$asset' not found. Attach it to a GitHub release first (see README Releasing), or build locally and upload the zips by hand." ; exit 1; }
+      - run: bash scripts/build_macos_app.sh
+      - name: Zip Alfred.app
+        run: |
+          mkdir -p dist/release
+          ditto -c -k --sequesterRsrc --keepParent dist/mac-app/Alfred.app dist/release/Alfred-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Alfred-Mac
+          path: dist/release/Alfred-Mac.zip
+
+  build-windows:
+    needs: fetch-rules-check
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download rules.json release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="${{ needs.fetch-rules-check.outputs.asset_name }}"
+          gh release download --repo "${{ github.repository }}" --pattern "$asset" -O data/rules.json \
+            || { echo "::error::release asset '$asset' not found. Attach it to a GitHub release first (see README Releasing), or build locally and upload the zips by hand." ; exit 1; }
+      - run: bash tools/build_windows_package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Alfred-Windows
+          path: dist/windows/Alfred-Windows.zip
+
+  release:
+    needs: [build-mac, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Alfred-Mac/Alfred-Mac.zip
+            Alfred-Windows/Alfred-Windows.zip

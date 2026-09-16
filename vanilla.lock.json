@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "preset": "vanilla",
+  "profile": "vanilla",
+  "rules_path": "data/rules.json",
+  "rules_sha256": "687377511a34a2e0c01098f8766093211a90589c0947ea56564f32600ba144e3",
+  "game_build_id": "24237342",
+  "labels": {
+    "path": "data/purpose_labels_vanilla.json",
+    "sha256": "2d4c364f9af393adeb0361aaaac8ece2bd1125f68d4fa9aa8a010d0d78766493",
+    "rulebook_sha256": "687377511a34a2e0c01098f8766093211a90589c0947ea56564f32600ba144e3",
+    "review_status": "reviewed_offline_independent_approved"
+  }
+}

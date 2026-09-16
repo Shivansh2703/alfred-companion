@@ -57,7 +57,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path .cache | Out-Null
           Set-Content -Path .cache\profile -Value 'vanilla' -NoNewline
           $log = "$env:APPDATA\companion.log"
-          $p = Start-Process -FilePath python -ArgumentList "daemon\aigen.py","--companion" `
+          $p = Start-Process -FilePath python -ArgumentList "-X","utf8=0","-u","daemon\aigen.py","--companion" `
               -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
           "COMPANION_PID=$($p.Id)" >> $env:GITHUB_ENV
 
@@ -77,7 +77,22 @@ jobs:
           $data = Get-Content $info -Raw | ConvertFrom-Json
           "WEBUI_PORT=$($data.port)" >> $env:GITHUB_ENV
 
+      - name: Diagnose companion process + port before GET
+        shell: pwsh
+        run: |
+          Write-Host "== Get-Process -Id $env:COMPANION_PID =="
+          Get-Process -Id $env:COMPANION_PID -ErrorAction SilentlyContinue | Format-List Id,ProcessName,HasExited
+          if (-not (Get-Process -Id $env:COMPANION_PID -ErrorAction SilentlyContinue)) { Write-Host "process is NOT running" }
+          Write-Host "== netstat -ano | findstr :$env:WEBUI_PORT =="
+          netstat -ano | findstr ":$env:WEBUI_PORT"
+          Write-Host "== companion.log =="
+          Get-Content "$env:APPDATA\companion.log" -ErrorAction SilentlyContinue
+          Write-Host "== companion.log.err =="
+          Get-Content "$env:APPDATA\companion.log.err" -ErrorAction SilentlyContinue
+
       - name: GET / expects 200 and the status text
+        id: get_root
+        continue-on-error: true
         shell: pwsh
         run: |
           $resp = Invoke-WebRequest "http://127.0.0.1:$env:WEBUI_PORT/" -UseBasicParsing
@@ -94,7 +109,16 @@ jobs:
       - name: Print companion log tail (must be plain words, not a traceback)
         if: always()
         shell: pwsh
-        run: Get-Content "$env:APPDATA\companion.log" -Tail 40 -ErrorAction SilentlyContinue
+        run: |
+          Write-Host "== companion.log tail =="
+          Get-Content "$env:APPDATA\companion.log" -Tail 40 -ErrorAction SilentlyContinue
+          Write-Host "== companion.log.err tail =="
+          Get-Content "$env:APPDATA\companion.log.err" -Tail 40 -ErrorAction SilentlyContinue
+
+      - name: Fail job if GET / did not pass
+        if: steps.get_root.outcome == 'failure'
+        shell: pwsh
+        run: throw "GET / expects 200 and the status text failed (see diagnostics above)"
 
       - name: Stop companion
         if: always()

@@ -14,6 +14,7 @@ datas = [
     (str(ROOT / "alfred.companion.json"), "."),
     (str(ROOT / ".cache" / "profile"), ".cache"),
     (str(ROOT / "app" / "starting.html"), "app"),
+    (str(ROOT / "app" / "move_to_applications.html"), "app"),
 ]
 a = Analysis([str(ROOT / "app" / "alfred_app.py")], datas=datas,
              pathex=[str(ROOT), str(ROOT / "daemon")], binaries=[],

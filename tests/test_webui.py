@@ -74,8 +74,10 @@ class Get(WebUITestCase):
         self.assertIn("Alfred is ready. Start Warhammer III.", body)
         self.assertIn("<form", body)
         self.assertIn('name="provider"', body)
-        self.assertIn('name="model"', body)
+        self.assertNotIn('name="model"', body)
         self.assertIn('name="api_key"', body)
+        self.assertIn("Gemini", body)
+        self.assertIn("Ollama (this computer)", body)
 
 
 class Security(WebUITestCase):
@@ -97,16 +99,30 @@ class Security(WebUITestCase):
 class Setup(WebUITestCase):
     def test_valid_setup_calls_apply_and_never_echoes_key(self):
         status, body = self._post(
-            "/setup", f"token={self.token}&provider=gemini&model=test-model&api_key=SECRET-XYZ")
+            "/setup", f"token={self.token}&provider=gemini&api_key=SECRET-XYZ")
         self.assertEqual(status, 200)
         self.assertEqual(self.apply_setup.calls,
-                         [{"provider": "gemini", "model": "test-model", "api_key": "SECRET-XYZ"}])
+                         [{"provider": "gemini", "model": "gemini-3.5-flash-lite",
+                           "api_key": "SECRET-XYZ"}])
         self.assertNotIn("SECRET-XYZ", body)
+
+    def test_posted_model_is_ignored(self):
+        status, body = self._post(
+            "/setup", f"token={self.token}&provider=gemini&model=some-other-model&api_key=SECRET-XYZ")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.apply_setup.calls[0]["model"], "gemini-3.5-flash-lite")
+        self.assertNotIn("some-other-model", body)
+
+    def test_ollama_uses_default_model_and_needs_no_key(self):
+        status, body = self._post("/setup", f"token={self.token}&provider=ollama")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.apply_setup.calls,
+                         [{"provider": "ollama", "model": "qwen3.5:4b"}])
 
     def test_invalid_key_shows_error_and_writes_nothing(self):
         long_key = "A" * 2000
         status, body = self._post(
-            "/setup", f"token={self.token}&provider=gemini&model=test-model&api_key={long_key}")
+            "/setup", f"token={self.token}&provider=gemini&api_key={long_key}")
         self.assertEqual(status, 200)
         self.assertIn("setup API key is invalid", body)
         self.assertNotIn(long_key, body)
@@ -126,7 +142,7 @@ class SetupWithRealAigen(unittest.TestCase):
                 try:
                     long_key = "A" * 2000
                     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    body = f"token={token}&provider=gemini&model=m&api_key={long_key}".encode()
+                    body = f"token={token}&provider=gemini&api_key={long_key}".encode()
                     conn.request("POST", "/setup", body=body,
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
                     resp = conn.getresponse()
@@ -223,7 +239,7 @@ class Logging(WebUITestCase):
         buf = io.StringIO()
         with redirect_stdout(buf):
             self._post("/setup",
-                      f"token={self.token}&provider=gemini&model=test-model&api_key=SECRET-XYZ")
+                      f"token={self.token}&provider=gemini&api_key=SECRET-XYZ")
         self.assertNotIn("SECRET-XYZ", buf.getvalue())
 
 
@@ -246,7 +262,11 @@ class AtomicWrites(unittest.TestCase):
     def test_write_setup_config_leaves_no_tmp_and_is_0600(self):
         with tempfile.TemporaryDirectory() as home:
             data_dir = Path(home) / "data"
-            with mock.patch.dict(os.environ, {"ALFRED_DATA_DIR": str(data_dir)}):
+            # _config_path() resolves to the real repo root by default — never let this test
+            # write alfred.local.json there (it would clobber the owner's real config and,
+            # under scripts/check.sh, silently repoint the live daemon at "https://x").
+            with mock.patch.object(aigen, "_config_path", lambda: str(Path(home) / "alfred.local.json")), \
+                 mock.patch.dict(os.environ, {"ALFRED_DATA_DIR": str(data_dir)}):
                 aigen._write_setup_config({"provider": "ollama", "model": "m",
                                             "base_url": "http://127.0.0.1:11434"})
                 cfg_path = aigen._config_path()

@@ -7,6 +7,7 @@ import os
 import plistlib
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -102,7 +103,39 @@ class Translocation(unittest.TestCase):
                 alfred_app.plain_open(runner=runner, home=home, opener=opened.append)
             self.assertFalse((Path(home) / "Library/LaunchAgents" / alfred_app.PLIST_NAME).exists())
             self.assertEqual(runner.calls, [])
-            self.assertEqual(opened, ["about:blank"])
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(opened[0].endswith("move_to_applications.html"))
+
+    def test_plain_open_non_applications_opens_move_page_installs_nothing(self):
+        """Box 11 (live-found): a Downloads launch used to open about:blank with nothing
+        else shown. It must now open the move-to-Applications page, and still install no
+        LaunchAgent (a plist pointed at a Downloads path breaks after reboot anyway)."""
+        with tempfile.TemporaryDirectory() as home:
+            runner = FakeRunner()
+            opened = []
+            with mock.patch.object(sys, "executable",
+                                   "/Users/x/Downloads/Alfred.app/Contents/MacOS/Alfred"):
+                alfred_app.plain_open(runner=runner, home=home, opener=opened.append)
+            self.assertFalse((Path(home) / "Library/LaunchAgents" / alfred_app.PLIST_NAME).exists())
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(len(opened), 1)
+            uri = opened[0]
+            self.assertTrue(uri.startswith("file://"))
+            self.assertTrue(uri.endswith("move_to_applications.html"))
+
+
+class MoveToApplicationsPageStaged(unittest.TestCase):
+    """The move-to-Applications page must be staged the same way starting.html already is
+    (app/alfred.spec datas, scripts/build_macos_app.sh staging) — starting.html was left
+    out of one of these once before and that is exactly the gap this guards."""
+
+    def test_spec_bundles_move_to_applications_html(self):
+        spec_text = (ROOT / "app" / "alfred.spec").read_text()
+        self.assertIn("move_to_applications.html", spec_text)
+
+    def test_build_script_stages_move_to_applications_html(self):
+        script_text = (ROOT / "scripts" / "build_macos_app.sh").read_text()
+        self.assertIn("move_to_applications.html", script_text)
 
 
 class Stop(unittest.TestCase):
@@ -259,6 +292,48 @@ class PlainOpenWebUI(unittest.TestCase):
                 runner = FakeRunner()
                 alfred_app.stop(runner=runner, home=home)
                 self.assertFalse(Path(webui.info_path(str(data_dir))).exists())
+
+
+class DmgScript(unittest.TestCase):
+    """Box 11 scope addition: the Mac download is a drag-to-Applications disk image."""
+
+    def test_dmg_script_has_applications_symlink_and_udzo(self):
+        script = (ROOT / "scripts" / "build_macos_dmg.sh").read_text()
+        self.assertIn("ln -s /Applications", script)
+        self.assertIn("UDZO", script)
+
+    def test_build_script_calls_dmg_script(self):
+        script = (ROOT / "scripts" / "build_macos_app.sh").read_text()
+        self.assertIn("build_macos_dmg.sh", script)
+
+    def test_dmg_mounts_with_app_and_applications_symlink(self):
+        import shutil
+        app = ROOT / "dist" / "mac-app" / "Alfred.app"
+        if shutil.which("hdiutil") is None or not app.is_dir():
+            self.skipTest("hdiutil unavailable or Alfred.app not built")
+        # build_macos_dmg.sh resolves ROOT from its own script location (`cd $(dirname "$0")/..`)
+        # and always writes dist/mac-app/Alfred-Mac.dmg under that ROOT with `rm -f` first — run
+        # it against a real copy of the repo's script tree, never the real one, so this test
+        # never rewrites a release artifact someone may be about to ship.
+        fake_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, fake_root, ignore_errors=True)
+        (fake_root / "scripts").mkdir()
+        shutil.copy2(ROOT / "scripts" / "build_macos_dmg.sh", fake_root / "scripts" / "build_macos_dmg.sh")
+        (fake_root / "dist" / "mac-app").mkdir(parents=True)
+        shutil.copytree(app, fake_root / "dist" / "mac-app" / "Alfred.app")
+        dmg_script = fake_root / "scripts" / "build_macos_dmg.sh"
+        subprocess.run([str(dmg_script)], check=True, cwd=str(fake_root))
+        dmg = fake_root / "dist" / "mac-app" / "Alfred-Mac.dmg"
+        self.assertTrue(dmg.is_file())
+        mount = tempfile.mkdtemp()
+        try:
+            subprocess.run(["hdiutil", "attach", "-nobrowse", "-readonly",
+                             "-mountpoint", mount, str(dmg)], check=True,
+                            capture_output=True, text=True)
+            self.assertTrue((Path(mount) / "Alfred.app").exists())
+            self.assertTrue((Path(mount) / "Applications").is_symlink())
+        finally:
+            subprocess.run(["hdiutil", "detach", mount], capture_output=True, text=True)
 
 
 class StartingPagePackaged(unittest.TestCase):

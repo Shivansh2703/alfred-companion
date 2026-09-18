@@ -15,7 +15,7 @@ done
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/app" "$STAGE/daemon" "$STAGE/data" "$STAGE/tools" "$STAGE/.cache"
-cp app/alfred_app.py app/alfred.spec app/starting.html "$STAGE/app/"
+cp app/alfred_app.py app/alfred.spec app/starting.html app/move_to_applications.html "$STAGE/app/"
 cp daemon/aigen.py daemon/paths.py daemon/webui.py "$STAGE/daemon/"
 cp data/rules.json data/purpose_labels_vanilla.json "$STAGE/data/"
 cp tools/vanilla_preflight.py "$STAGE/tools/"
@@ -52,3 +52,5 @@ python3 -m venv "$VENV"
 )
 
 "$ROOT/dist/mac-app/Alfred.app/Contents/MacOS/Alfred" --smoke
+
+"$ROOT/scripts/build_macos_dmg.sh"

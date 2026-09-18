@@ -16,7 +16,8 @@ import threading
 import urllib.parse
 
 INFO_FILE = "webui.json"
-PROVIDERS = ["gemini", "ollama", "openai_compatible"]
+PROVIDERS = [("gemini", "Gemini"), ("ollama", "Ollama (this computer)")]
+DEFAULT_MODELS = {"gemini": "gemini-3.5-flash-lite", "ollama": "qwen3.5:4b"}
 
 
 def info_path(data_dir_path):
@@ -52,7 +53,7 @@ def _host_ok(host_header):
 
 
 def _page(status_ok, status_message, token, error=None, saved=False, stop_available=True):
-    options = "".join(f'<option value="{p}">{p}</option>' for p in PROVIDERS)
+    options = "".join(f'<option value="{value}">{label}</option>' for value, label in PROVIDERS)
     status_class = "ok" if status_ok else "warn"
     banner = ""
     if saved:
@@ -83,8 +84,7 @@ button {{ margin-top: 1.5em; padding: 0.5em 1em; }}
 <form method="post" action="/setup">
 <input type="hidden" name="token" value="{html.escape(token)}">
 <label>Provider<select name="provider" required>{options}</select></label>
-<label>Model<input type="text" name="model" required></label>
-<label>API key (not needed for Ollama)<input type="password" name="api_key"></label>
+<label>API key (leave blank for Ollama)<input type="password" name="api_key"></label>
 <button type="submit">Save</button>
 </form>
 {stop_form}
@@ -166,13 +166,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._reject(404)
 
     def _handle_setup(self, fields):
-        payload = {"provider": fields.get("provider", [""])[0],
-                   "model": fields.get("model", [""])[0]}
+        provider = fields.get("provider", [""])[0]
+        model = DEFAULT_MODELS.get(provider)
+        stop_available = self.server.stop_fn is not None
+        ok, message = self._status()
+        if not model:
+            return self._send_html(_page(ok, message, self.server.token,
+                                          error="Choose Gemini or Ollama.",
+                                          stop_available=stop_available))
+        payload = {"provider": provider, "model": model}
         api_key = fields.get("api_key", [""])[0]
         if api_key:
             payload["api_key"] = api_key
-        stop_available = self.server.stop_fn is not None
-        ok, message = self._status()
         try:
             self.server.apply_setup_request(payload)
         except ValueError as e:

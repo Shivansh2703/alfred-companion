@@ -15,20 +15,18 @@ else.
 
 ## Install on Mac
 
-
-
 1. Make sure Total War: WARHAMMER III is installed. Launch it once, then quit back to the
    desktop — this lets your Mac create the folder Alfred needs.
-2. Drag **Alfred** into your **Applications** folder.
+2. Open **Alfred-Mac.dmg**, drag Alfred into the Applications folder shown, then open Alfred
+   from Applications.
 3. Open Alfred. Your Mac will block it the first time because it isn't from the App Store.
    Go to **System Settings → Privacy & Security**, find the message about Alfred, and click
    **Open Anyway**. Enter your Mac password when asked.
-4. Alfred opens a page in your browser (Set up model) that shows Alfred's status. It now starts
-   quietly by itself every time you log in — you don't need to open it again unless you want to
-   change settings or stop it.
-5. On that page, add your Gemini API key (see below) or point Alfred at a local Ollama model
-   instead, then click **Save**.
-6. In the game, enable **Alfred** and **Mod Configuration Tool** in the mod list, use the
+4. Alfred opens a page in your browser (Set up model). Paste your Gemini API key (see below) or
+   point Alfred at a local Ollama model, then click **Save**. Alfred sends a short test prompt;
+   when that works the page says Alfred is ready. It then starts quietly by itself every time
+   you log in — you don't need to open it again unless you want to change settings or stop it.
+5. In the game, enable **Alfred** and **Mod Configuration Tool** in the mod list, use the
    Vanilla preset, and turn off any overhaul packs. Play.
 
 ## Getting a free Gemini key
@@ -58,16 +56,6 @@ menu bar icon), then restart the game. If it still doesn't respond, quit and reo
 When Warhammer III updates, Alfred refuses to start until a matching Alfred Companion is
 downloaded, and says so plainly. This is normal — download the newest version from the same
 place you got this one.
-
-## Stopping and uninstalling
-
-1. Open Alfred and click **Stop Alfred**. This removes it from your login items.
-2. Delete the Alfred app from Applications.
-3. Unsubscribe from the Workshop item (and Mod Configuration Tool if you don't use it
-   elsewhere).
-
-Stopping or deleting the app never deletes your saved key or chat history on its own — see
-Advanced below if you want those gone too.
 
 ## What this is
 
@@ -123,12 +111,7 @@ a `rules-*.json` asset already exists.
   from the Workshop item. Delete `~/Library/Application Support/Alfred/` to remove your saved
   key and chat history.
 - **Windows**: run `Stop Alfred.vbs`, delete the unzipped folder, unsubscribe from the Workshop
-  item.
-
-## Workshop item
-
-<!-- TODO(owner): Workshop listing link, once published. -->
-https://steamcommunity.com/sharedfiles/filedetails/?id=PLACEHOLDER
+  item. Delete `%APPDATA%\Alfred` to remove your saved key and chat history.
 
 ## License
 

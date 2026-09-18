@@ -28,7 +28,9 @@ SWEEP_REQUEST = CHAT_REQUEST = CHAT_REPLY = SETUP_REQUEST = None
 CHAT_HISTORY = os.path.join(data_dir(ROOT), "chat_history.json")  # survives a daemon restart
 CHAT_KEEP = 10        # exchanges kept (both for Alfred's memory and for the panel scrollback)
 CHAT_WRAP = 58        # chars per rendered row; chat_string rows do not wrap themselves
-REPLY_CAP = 700       # 1200 produced walls of text in a 58-char-wide window
+REPLY_CAP = 1200      # was 700 (a 58-char-wide window walled with text); CHAT_SYSTEM now
+# invites an answer as long as the question needs, so the cap needs to be the panel's real
+# ceiling, not an artificial second one — see _cap_reply for the truncation itself.
 MAX_SKILL_OPTIONS = 12   # per character, keep the prompt terse
 PROMPT_FX_MAX = 3        # effects shown per building option (rulebook keeps more)
 # Below this, a building's gold figure is a side-effect rather than the reason to buy it, so
@@ -43,9 +45,7 @@ _PENDING_PURPOSE = None  # daemon memory only; never reconstructed from chat his
 
 MIN_SLOT_BREADTH = 3        # permitted slot templates below which a chain is a landmark, not an option
 MAX_NEW_BUILD_OPTIONS = 8   # cheapest level-0 chains offered per empty slot, keep the prompt terse
-DRY = "--dry-run" in sys.argv
 MODEL_CONFIG = "alfred.local.json"
-CREDENTIALS = os.path.join(data_dir(ROOT), "alfred-credentials.json")
 
 
 def bind_exchange(path):
@@ -277,18 +277,27 @@ def apply_setup_request(payload):
     _write_setup_config(config)
 
 
-def request_decision(system, prompt):
+def request_decision(system, prompt, timeout_seconds=None):
     """Ask the configured model once and return only a complete JSON decision object."""
     config = load_model_config()
     started = time.monotonic()
     provider, model = config["provider"], config["model"]
+    timeout = config["timeout_seconds"] if timeout_seconds is None else timeout_seconds
     tokens = "unavailable"
     if provider == "claude":
         try:
             result = subprocess.run(headless_argv(system, prompt), capture_output=True, text=True,
-                                    timeout=config["timeout_seconds"], stdin=subprocess.DEVNULL)
+                                    timeout=timeout, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as e:
             raise RuntimeError("Claude timed out; no commands were issued") from e
+        except FileNotFoundError as e:
+            # No config file defaults to this provider (owner's own machine relies on that),
+            # but a fresh install has no `claude` CLI at all — the historical default silently
+            # assumed one exists. Caught here, not with a shutil.which precheck, so the same
+            # line also covers the CLI vanishing between a check and this call.
+            raise SetupError(
+                "Alfred doesn't have a model yet. Set your model in the Alfred Companion app "
+                "and press Save.") from e
         if result.returncode:
             raise RuntimeError(f"Claude exited {result.returncode}; no commands were issued")
         decision = _parse_decision(result.stdout)
@@ -300,7 +309,7 @@ def request_decision(system, prompt):
                        "format": _decision_schema(), "think": False,
                        "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 4096},
                        "keep_alive": 0}
-            response = _http_json(url, payload, config["timeout_seconds"])
+            response = _http_json(url, payload, timeout)
             message = response.get("message") if isinstance(response, dict) else None
             content = message.get("content") if isinstance(message, dict) else None
             truncated = response.get("done_reason") == "length" if isinstance(response, dict) else False
@@ -318,7 +327,7 @@ def request_decision(system, prompt):
                            "name": "alfred_decision", "strict": True, "schema": _decision_schema()}}}
             if config.get("reasoning_effort") is not None:
                 payload["reasoning_effort"] = config["reasoning_effort"]
-            response = _http_json(url, payload, config["timeout_seconds"],
+            response = _http_json(url, payload, timeout,
                                   {"Authorization": "Bearer " + api_key})
             choices = response.get("choices") if isinstance(response, dict) else None
             choice = choices[0] if isinstance(choices, list) and choices else None
@@ -331,6 +340,99 @@ def request_decision(system, prompt):
         decision = _parse_decision(content, truncated=truncated)
     print(f"model provider={provider} model={model} elapsed={time.monotonic() - started:.1f}s tokens={tokens}")
     return decision
+
+
+PROBE_SYSTEM = "Return only a JSON object."
+PROBE_PROMPT = 'Return {"reply":"ok","skills":[],"buildings":[]}.'
+PROBE_TIMEOUT = 30
+_PROBE = None  # ((provider, model), ok, message) — one live call per helper start, again on Save
+
+
+def _redact_probe_text(text):
+    if not isinstance(text, str):
+        return str(text)
+    key = _stored_api_key()
+    if key:
+        text = text.replace(key, "[redacted]")
+    for env_name in ("GEMINI_API_KEY", "OPENAI_API_KEY"):
+        val = os.environ.get(env_name)
+        if val:
+            text = text.replace(val, "[redacted]")
+    return text
+
+
+def _probe_message(exc):
+    text = _redact_probe_text(str(exc))
+    if "HTTP 401" in text or "HTTP 403" in text:
+        return "The model rejected the API key. Check it and Save again."
+    if "HTTP 404" in text:
+        return "That model is not available. Check the model name and Save again."
+    if "HTTP 429" in text:
+        return "The model is rate-limited. Wait a minute and Save again."
+    lowered = text.lower()
+    if "timed out" in lowered or "timeoutexpired" in lowered or "timeout" in lowered:
+        return "The model did not answer in time. Check the connection and Save again."
+    if "API key is unavailable" in text:
+        return "Set your model and API key, then Save."
+    return text or "The model test failed. Check the connection and Save again."
+
+
+def probe_model():
+    """One tiny request through the same path as a real decision. Issues no commands."""
+    try:
+        config = load_model_config()
+    except ValueError as e:
+        return False, str(e)
+    if config["provider"] == "claude":
+        return False, "Set your model and API key, then Save."
+    try:
+        decision = request_decision(PROBE_SYSTEM, PROBE_PROMPT, timeout_seconds=PROBE_TIMEOUT)
+    except Exception as e:
+        return False, _probe_message(e)
+    if not isinstance(decision, dict) or "reply" not in decision:
+        return False, "The model replied, but not in the shape Alfred needs."
+    return True, "model check passed"
+
+
+def save_setup(payload):
+    """Write setup, then always run the test prompt (forget clears the cache and does not call)."""
+    global _PROBE
+    apply_setup_request(payload)
+    if payload == {"action": "forget"}:
+        _PROBE = None
+        return
+    ok, msg = probe_model()
+    config = load_model_config()
+    _PROBE = ((config["provider"], config["model"]), ok, msg)
+
+
+def ready_status():
+    """Game folders, this companion's build, then a real model test. Ready means the test passed."""
+    global _PROBE
+    ok, message = check_setup()
+    if not ok:
+        return False, message
+    try:
+        expected = _expected_build_id()
+        if expected is not None and expected != game_build_id_live():
+            return False, _build_mismatch_message(expected)
+    except SetupError as e:
+        return False, str(e)
+    try:
+        config = load_model_config()
+    except ValueError as e:
+        return False, str(e)
+    if config["provider"] == "claude":
+        return False, "Set your model and API key, then Save."
+    key = (config["provider"], config["model"])
+    if _PROBE is None or _PROBE[0] != key:
+        ok_p, msg_p = probe_model()
+        _PROBE = (key, ok_p, msg_p)
+    else:
+        ok_p, msg_p = _PROBE[1], _PROBE[2]
+    if not ok_p:
+        return False, msg_p
+    return True, "Alfred is ready. Start Warhammer III."
 
 # skill display names, e.g. wh2_main_skill_hef_tyrion_army_buff_3 -> "Combined Elites".
 # .cache is gitignored/per-machine extraction output — best-effort garnish for the prompt
@@ -1153,6 +1255,16 @@ def dev_ok(level_rec, have):
 def building_upgrades(rules, state):
     """Per owned slot with a building: its next level + cost."""
     levels = rules["buildings"]["levels"]
+    # 2026-09-17 faction gate (alfred-20260917-faction-rules-affordability): _building_available
+    # was only ever called from building_construction's new-build pool, so a settlement that
+    # already carries a faction-locked chain (e.g. Aislinn's Dragonship Colony, captured or
+    # inherited) kept offering its NEXT level to any faction with no faction check at all — the
+    # race-token heuristic in building_construction never runs here. avail missing entirely
+    # (old rulebook) fails OPEN, same convention as primary_ok/dev_ok above.
+    avail = rules["buildings"].get("availability") or {}
+    faction = state.get("faction")
+    culture = state.get("culture")
+    subculture = state.get("subculture")
     out = []
     for region in (state.get("regions") if isinstance(state.get("regions"), list) else []):
         if region.get("under_siege") is True:
@@ -1164,7 +1276,9 @@ def building_upgrades(rules, state):
             nxt = levels[b].get("next")
             # the next level can need a bigger settlement than this region has
             if nxt and not (primary_ok(levels.get(nxt), primary_level(region, levels))
-                            and dev_ok(levels.get(nxt), region.get("development_points"))):
+                            and dev_ok(levels.get(nxt), region.get("development_points"))
+                            and (not avail or _building_available(avail.get(nxt), faction,
+                                                                   culture, subculture))):
                 continue
             if nxt:
                 out.append({"region": region["region"], "slot_idx": slot["idx"],
@@ -2044,7 +2158,6 @@ def situation_lines(state, rules=None, cap_armies=4):
 
 def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=None):
     prefs = prefs or {"stance": "balanced", "reserve_floor": RESERVE_FLOOR_MIN,
-                       "sliders": dict(SLIDER_DEFAULTS),
                        "capabilities": dict(CAP_DEFAULTS)}
     floor = effective_floor(state, prefs)
     # .get, not [] — a state dump missing a key must degrade, never crash the daemon.
@@ -2080,7 +2193,7 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
     if prefs.get("stance", "balanced") != "balanced":
         lines.append("PLAYER PREFERENCE: " + STANCES[prefs["stance"]])
     caps = clamp_caps(prefs.get("capabilities"))
-    lines += slider_lines(prefs.get("sliders"))
+    lines.append(TONE_LINE)
     # An unchecked capability is not mentioned, not offered, and not explained. Telling him
     # "you may not do X" is still telling him X exists, and he will suggest it in prose.
     off = [k for k in CAPABILITIES if not caps[k]]
@@ -2185,6 +2298,21 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
             lines.append("BUILDING PURPOSE GUARD: reviewed Vanilla labels are unavailable; do not issue a building order.")
         else:
             lines.append(f"BUILDING PURPOSE GUARD: issue building commands only for {_request_label(purpose)} from the listed options.")
+    # 2026-09-17 affordability (alfred-20260917-faction-rules-affordability, owner: "treasury
+    # empty = attrition"): an option costing more than treasury-minus-floor was rendered and
+    # offered as a pick same as any other, with no signal it would be refused. `afford_ups` is
+    # the RENDER-ONLY subset below — `ups` itself is returned unfiltered, so a named pick of an
+    # option that's legal-but-over-budget still falls through validate()'s existing reserve-
+    # floor branch (real reason, FALSE_CLAIM re-ask) instead of the silent "not enumerated" one
+    # a hallucinated building gets; only what's OFFERED as a suggestion changes here.
+    afford_ups = ups
+    if ups:
+        budget = (state.get("treasury") or 0) - floor
+        afford_ups = [u for u in ups if u["cost"] <= budget]
+        if not afford_ups:
+            lines.append(f"BUILDING OPTIONS: none affordable right now — treasury "
+                         f"{state.get('treasury', 0)}, reserve {floor}. Tell him to save up; "
+                         f"do not list or propose any building.")
     # CA scores a building against the province it goes in, not in isolation (450 rows,
     # 319 of them negative). Computed once here and attached to every option line below.
     verdicts = synergy_verdicts(state, rules)
@@ -2249,9 +2377,9 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
             # no upgrade below) doesn't need its full chain list re-stated every sweep — one
             # line is enough to keep it in view. A region WITH an option still gets the full
             # line, same as full mode, since that's what the [UPGRADE] lines below are about.
-            has_upgrade = any(u["region"] == region["region"] and not u["new"] for u in ups)
+            has_upgrade = any(u["region"] == region["region"] and not u["new"] for u in afford_ups)
             rname = _region_name(rules, region["region"])
-            rtags = _region_tags(rules, region, ups)
+            rtags = _region_tags(rules, region, afford_ups)
             tag_str = (" [" + ", ".join(rtags) + "]") if rtags else ""
             if not is_full and empty == 0 and not has_upgrade:
                 lines.append(f"- {rname}: {len(chains)} buildings{po_str}{tag_str}")
@@ -2261,7 +2389,7 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
                          f"({empty} empty slot{'s' if empty != 1 else ''}"
                          f"{locked_str}{po_str}){tag_str}")
         if show_building_options:
-            for u in ups:
+            for u in afford_ups:
                 if u["region"] not in region_keys:
                     continue
                 # NEW options are rendered ONCE below, not per empty slot. Measured 2026-08-31:
@@ -2303,7 +2431,7 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
 
     # Keep the costly explanation once per building, but print every legal command triple.
     new_opts, slots = {}, []
-    for u in ups:
+    for u in afford_ups:
         if not u["new"]:
             continue
         pair = (u["region"], u["slot_idx"])
@@ -2357,43 +2485,39 @@ def headless_argv(system, prompt):
             "--mcp-config", '{"mcpServers":{}}', "--system-prompt", system, prompt]
 
 
-def call_llm(prompt):
-    # THE STANDING INSTRUCTIONS GO IN THE SYSTEM PROMPT, not pasted into the user turn.
-    #
-    # Owner, 2026-09-01: "we dont need to send a huge prompt everytime we can do it once at the
-    # start of the campaign and then later smaller prompts". This is the free half of that.
-    # MEASURED on his 2-region campaign: the standing text is ~1340 tokens of a ~2500-token
-    # call — 53% — and it is byte-identical on every call, while the state half changes every
-    # turn. As a system prompt it is a stable prefix and can be cached, which is "sent once"
-    # in the only sense that costs anything.
-    #
-    # What this does NOT do, so nobody reads more into it: it does not keep a session. His
-    # literal proposal — one session per campaign — was put to him with the counter-evidence
-    # from his own SPEC.md ("no history accumulation — Vox Deorum hit quadratic token growth
-    # without this"), and he chose this instead. The state half still grows with the empire
-    # (786 tokens at 2 regions, 7193 at 40) and no amount of caching touches that.
-    #
-    # Verified before changing rather than assumed: --system-prompt REPLACES the CLI's default
-    # system prompt, so both shapes were run side by side on the same task and returned
-    # identical output.
-    return request_decision(SYSTEM, prompt)
-
-
 # B1b: how many skills one character may receive in a sweep when the mod could not
 # read their real unspent-point count. One, not unlimited.
 UNKNOWN_POINTS_CAP = 1
 
 
+def _dropped_building_label(rules, b):
+    """Player-facing label for a DROP entry — display name + region, same lookup
+    _describe_option uses, so a re-ask about a dropped building reads like the rest of the
+    prompt rather than a raw key."""
+    levels = (rules.get("buildings") or {}).get("levels") or {}
+    name = (levels.get(b.get("building")) or {}).get("name") or b.get("building") or "a building"
+    return f"{name} at {_region_name(rules, b.get('region'))}"
+
+
+def _dropped_skill_label(chars, s):
+    c = chars.get(s.get("cqi"))
+    return (c.get("name") if c else None) or f"cqi {s.get('cqi')}"
+
+
 def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
-             building_only=False):
+             building_only=False, dropped=None):
     """Belt: only enumerated choices survive (mod is the suspenders).
 
     B7: `may_act` False drops every command regardless of legality — the player asked a
     question, not for work. This gate is here in Python rather than only in the prompt,
-    where a stored preference or a persuasive message could talk past it."""
+    where a stored preference or a persuasive message could talk past it.
+
+    `dropped`, when given a list, gets one {"kind", "label", "reason"} entry appended per
+    command this call refuses — structured, plain-language, and label-matched to what the
+    print() lines already say — so a caller (chat()'s FALSE_CLAIM fix) can re-ask the model
+    with the real reason instead of leaving a silently-dropped order looking sent."""
     cmds = []
     prefs = prefs or {"stance": "balanced", "reserve_floor": RESERVE_FLOOR_MIN,
-                       "sliders": dict(SLIDER_DEFAULTS),
                        "capabilities": dict(CAP_DEFAULTS)}
     floor = effective_floor(state, prefs)
     # THE MODEL'S OUTPUT IS UNTRUSTED SHAPE, not just untrusted content. Everything below
@@ -2425,18 +2549,26 @@ def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
     # This one drops the command whatever the prompt said. Logged, never silent: a refused
     # command is indistinguishable from a completed one from outside, which is the failure
     # mode this whole file is built around.
+    chars = {c["cqi"]: c for c in (state.get("characters") or [])}
     caps = clamp_caps(prefs.get("capabilities"))
     for key in ("skills", "buildings"):
         if decision[key] and not caps[key]:
             print(f"  DROP all {len(decision[key])} {key} command(s): "
                   f"{key} is switched off by the player")
+            if dropped is not None:
+                for item in decision[key]:
+                    label = (_dropped_building_label(rules, item) if key == "buildings"
+                             else _dropped_skill_label(chars, item))
+                    dropped.append({"kind": key[:-1], "label": label,
+                                     "reason": f"{key} are switched off in Alfred's settings — "
+                                     "turn them on in the Alfred page of the Mod "
+                                     "Configuration Tool"})
             decision[key] = []
     if not may_act:
         n = len(decision.get("skills", [])) + len(decision.get("buildings", []))
         if n:
             print(f"  DROP all {n} command(s): the player asked a question, not for action")
         return []
-    chars = {c["cqi"]: c for c in (state.get("characters") or [])}
     skill_used = {}  # cqi -> accepted skill commands so far this sweep
     for s in decision.get("skills", []):
         c = chars.get(s.get("cqi"))
@@ -2472,10 +2604,20 @@ def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
             skill_used[cqi] = skill_used.get(cqi, 0) + 1
         elif not is_legal:
             print(f"  DROP skill {s} (not in enumerated options)")
+            if dropped is not None:
+                dropped.append({"kind": "skill", "label": _dropped_skill_label(chars, s),
+                                 "reason": f"no such skill option for "
+                                 f"{_dropped_skill_label(chars, s)}"})
         elif not under_levels:
             print(f"  DROP skill {s} (only {room} level(s) left in that skill)")
+            if dropped is not None:
+                dropped.append({"kind": "skill", "label": _dropped_skill_label(chars, s),
+                                 "reason": "already at the highest level"})
         else:
             print(f"  DROP skill {s} (exceeds {cqi}'s {pts} skill points this sweep)")
+            if dropped is not None:
+                dropped.append({"kind": "skill", "label": _dropped_skill_label(chars, s),
+                                 "reason": "no skill points left this sweep"})
     legal_ups = {(u["region"], u["slot_idx"], u["building"]) for u in upgrade_options}
     sieged_regions = {r.get("region") for r in (state.get("regions") or [])
                       if r.get("under_siege") is True}
@@ -2492,6 +2634,9 @@ def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
         slot_key = (b.get("region"), b.get("slot_idx"))
         if key[0] in sieged_regions:
             print(f"  DROP building {b} (region is under siege)")
+            if dropped is not None:
+                dropped.append({"kind": "building", "label": _dropped_building_label(rules, b),
+                                 "reason": "the region is under siege"})
             continue
         cost = next((u["cost"] for u in upgrade_options
                      if (u["region"], u["slot_idx"], u["building"]) == key), None)
@@ -2507,6 +2652,13 @@ def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
                          "building": b["building"], "cost": cost, "turns": turns,
                          "why": b.get("why", "")})
         elif key not in legal_ups:
+            # NOT captured into `dropped`, deliberately: a hallucinated tuple here already
+            # went through chat()'s own one-retry mismatch-correction before ever reaching
+            # validate() (it re-asks the model to copy an exact printed tuple), and
+            # _strip_false_completion_claims already strips any false "ordered" claim
+            # generically. Adding a second, reason-specific re-ask on top would fire a THIRD
+            # model call for the same hallucination and contradicts the one-retry contract
+            # (H2 test: exactly one retry).
             print(f"  DROP building {b} (not in the enumerated options)")
         else:
             # SAY WHICH. "illegal or breaks reserve floor" conflated a hallucinated key with
@@ -2514,6 +2666,9 @@ def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
             # identically in the log, and the second is the one worth telling him about.
             print(f"  DROP building {b} (costs {cost}, leaves "
                   f"{budget - (cost or 0)} against a floor of {floor})")
+            if dropped is not None:
+                dropped.append({"kind": "building", "label": _dropped_building_label(rules, b),
+                                 "reason": f"would take treasury below the {floor} reserve"})
     return cmds
 
 
@@ -2700,17 +2855,27 @@ CHAT_SYSTEM = """You are Alfred, campaign administrator to a Total War: Warhamme
 talking to him in a narrow in-game chat window. You handle settlement construction and \
 unspent skill points.
 
-HOW TO WRITE. Be brief. Two or three sentences is normal; six is the most you may ever \
-write, and only if he asked for a list. No preamble, no restating his question, no summary \
-at the end, no "my lord". Never repeat a number he can already see unless it changes your \
-answer. Do not say what you did NOT do. Plain sentences, not bullet lists, unless he asks \
-for options. When answering whether to save or spend, name the chosen listed income option \
-and its printed payback in turns.
+HOW TO WRITE. Be brief. Answer as long as the question needs — short for an order, fuller \
+for advice — never pad to fill space and never cut an answer short of what he asked. No \
+preamble, no restating his question, no summary at the end, no "my lord". Never repeat a \
+number he can already see unless it changes your answer. Do not say what you did NOT do. \
+Use a numbered list whenever you offer options; plain sentences otherwise. When answering \
+whether to save or spend, name the chosen listed income option and its printed payback in \
+turns.
 
 HOW TO ACT. If he asks you to do something, DO IT — do not ask him to confirm what he just \
 told you. Buildings are named: he will say "Plaza", you must emit the key beside it. If his \
 words match no option, say so in one line and name the closest one. Only ask a question \
-back when two options genuinely fit and the choice changes the outcome.
+back when two options genuinely fit and the choice changes the outcome. When you issue a \
+command, tell him the order was SENT this turn — never that it is queued or done; the game \
+confirms it asynchronously and you will not know the result until he tells you. An order \
+sent is not built: never claim a building exists, is upgraded, or is finished unless the \
+state itself lists it — a command you sent, even last turn, proves nothing about now. When \
+a SYSTEM NOTE says a gate found nothing or needs him to choose, explain that in your own \
+words — never a stock phrase, and never invent a reason the note didn't give you. When a \
+SYSTEM NOTE hands you a numbered list of options, present exactly those, in that order, \
+best first, and end with a short line inviting a pick by number — never a bare question \
+with no options, and never a guess.
 A specific requested building role or unit is an instruction: match it to a listed option by its displayed name, key, unlocks, or function, and do not replace it with a generic economy choice when that listed option is legal and affordable. Use only the option's printed legal slot(s); do not invent a CA ban, requirement, or location restriction that is not printed.
 
 THE GAME. It is an economy builder. Money buys armies, armies take regions, regions make \
@@ -2871,6 +3036,339 @@ def remember_purpose(cid, turn, request):
         _PENDING_PURPOSE = {"campaign_id": cid, "turn": turn, "request": request}
 
 
+# ---------------------------------------------------------------- numbered-options offer
+#
+# Owner, 2026-09-16 (DECISIONS.md ids alfred-20260916-reply-options,
+# alfred-20260916-unsure-options): "also would be better if gemini responded with options
+# like claude does" / "if unsure come back with option". Whenever chat() would otherwise
+# leave the player to guess (several legal buildings fit, or a question with nothing named),
+# it offers a short numbered list instead of a bare question — and a follow-up naming one BY
+# NUMBER acts on it at once, the same way a single-legal-option request already does.
+#
+# The list Alfred actually presented must be the one a pick resolves against, or "2" could
+# silently mean a different building than the one the player read. So the OFFERED subset —
+# never re-derived, never re-ranked — is what gets remembered, exactly as with
+# _PENDING_PURPOSE, and a turn/campaign mismatch discards it the same way.
+_PENDING_OPTIONS = None
+MAX_OFFERED_OPTIONS = 5
+
+
+def _describe_option(rules, u):
+    """One line for a numbered offer — display name, where, cost, and CA's own effect hint
+    (income buildings get their payback-in-turns via _fx_str, same as the option list)."""
+    levels = (rules.get("buildings") or {}).get("levels") or {}
+    name = (levels.get(u["building"]) or {}).get("name") or u.get("name") or u["building"]
+    bits = [f"cost {u['cost']}"]
+    fx = _fx_str(u)
+    if fx:
+        bits.append(fx)
+    return f"{name} at {_region_name(rules, u['region'])} ({', '.join(bits)})"
+
+
+# "no" alone is too broad a substring match: "no gold" and "no problem" contain the word "no"
+# without pushing back on anything. Restricted to "no" as the WHOLE message's leading word,
+# only when followed by end-of-message, a comma, or a period — never when it leads straight
+# into another word ("no gold"). The other pushback words stay plain substrings; they don't
+# have "no"'s false-positive-as-a-determiner problem.
+# REVERT CHECK (executed): reverting to the old bare `\bno\b` (matching "no" anywhere as its
+# own word) makes the "no gold" test below fail — it would be misread as pushback.
+_PUSHBACK_RE = re.compile(
+    r"\b(not|isn't|isnt|didn't|didnt|wrong)\b|^\s*no\b(?:[,.]|\s*$)", re.I)
+
+# The wrapper cannot cancel or undo a command it already wrote to aigen_commands.lua — that
+# has to happen in-game. Used only against the fact that the last thing decided this turn was
+# already sent (see chat()'s dedupe-collapse fix).
+_CANCEL_RE = re.compile(r"\b(cancel|undo|revert|take\s+back|stop\s+that)\b", re.I)
+
+# A question about which offered option costs least/most — the SYSTEM NOTE for these must
+# tell the model to answer directly from the costs already printed in the option list,
+# instead of just re-listing them (finding: "whats the cheapest option overall" went
+# unanswered even though the cost was right there in the prompt).
+COST_QUESTION_RE = re.compile(r"\b(cheap|cheapest|expensive|priciest|cost|costs|price)\b", re.I)
+
+# A "<Name> at <Region> (cost <N>" phrase — the shape a cost/comparison reply's own numbered
+# list uses (real-Gemini pass 2, finding #5: a "most expensive" answer invented two buildings
+# and a fake region name in exactly this shape). Used by _reply_has_unlisted_building below.
+_NAMED_OPTION_RE = re.compile(r"([A-Za-z][\w'’\-]*(?:\s+[A-Za-z][\w'’\-]*)*?)\s+at\s+"
+                              r"([A-Za-z][\w'’\-]*(?:\s+[A-Za-z][\w'’\-]*)*?)\s*"
+                              r"\(cost\s+(\d+)", re.I)
+
+
+def _reply_has_unlisted_building(reply, rules, options):
+    """A targeted hallucination check for a cost/comparison-question reply: a
+    '<Name> at <Region> (cost <N>' phrase in the model's own text that names a building,
+    region, or price combination that isn't one of the `options` it was actually offered is
+    treated as invented. Deliberately narrow — it only catches this exact printed shape, the
+    one the model itself used when it fabricated buildings — not a general fact-checker."""
+    if not reply or not options:
+        return False
+    levels = (rules.get("buildings") or {}).get("levels") or {}
+    legal = set()
+    for u in options:
+        name = (levels.get(u["building"]) or {}).get("name") or u.get("name") or u["building"]
+        legal.add((name.strip().lower(), _region_name(rules, u["region"]).strip().lower(),
+                   u.get("cost")))
+    for m in _NAMED_OPTION_RE.finditer(reply):
+        found = (m.group(1).strip().lower(), m.group(2).strip().lower(), int(m.group(3)))
+        if found not in legal:
+            return True
+    return False
+
+
+# "most expensive"/"cheapest" — used both to steer the SYSTEM NOTE and to post-check the
+# reply actually named the TRUE extreme among what was offered (real-Gemini pass 3, finding
+# #3: "and whats the most expensive one" got a truncated, correctly-real-but-INCOMPLETE list
+# that quietly dropped the actual most expensive option).
+_SUPERLATIVE_MIN_RE = re.compile(r"\bcheap(?:est)?\b", re.I)
+_SUPERLATIVE_MAX_RE = re.compile(r"\b(most\s+expensive|priciest|expensive)\b", re.I)
+
+
+def _reply_misses_superlative(reply, rules, options, message):
+    """For a "most expensive"/"cheapest" question, the reply must name the option that is
+    ACTUALLY the max/min cost among what was offered — a truncated or reordered re-list that
+    quietly omits it answers a different, unasked question. Narrow like
+    _reply_has_unlisted_building: only fires when the message asks for a specific extreme and
+    `reply` never says that option's display name at all."""
+    if not reply or not options:
+        return False
+    low = " ".join((message or "").lower().split())
+    want_min = bool(_SUPERLATIVE_MIN_RE.search(low))
+    want_max = bool(_SUPERLATIVE_MAX_RE.search(low))
+    if not (want_min or want_max) or (want_min and want_max):
+        return False
+    target = (min if want_min else max)(options, key=lambda u: u.get("cost") or 0)
+    levels = (rules.get("buildings") or {}).get("levels") or {}
+    name = (levels.get(target["building"]) or {}).get("name") or target.get("name") \
+        or target["building"]
+    return name.strip().lower() not in reply.lower()
+
+
+# Comparison/alternative vocabulary meaning "not the thing that was already sent" — used to
+# stop the already-sent override from firing on a message that names (even vaguely) something
+# ELSE (real-Gemini pass 3, finding #2: "the expensive one" after the cheap one shipped got
+# told "that was already sent", which is misleading about the one actually asked for).
+_DIFFERENT_TARGET_RE = re.compile(
+    r"\b(other|another|different|instead|expensive|priciest|cheap|cheapest)\b", re.I)
+
+# Bare/short state-metric queries (real-Gemini pass 3, finding #4: "income"/"treasury" are in
+# chat_prompt_intent's own "question" set and still drifted into a building re-list without an
+# explicit note; "upkeep percent"/"corruption level" aren't in that set at all and fell
+# through to intent="both", which offers buildings outright). Filler words are stripped so
+# "whats my public order like" reduces the same way a bare "public order" does.
+_METRIC_FILLER_RE = re.compile(
+    r"\b(whats|what's|what is|what|hows|how's|my|our|the|percent|level|like|doing|right now)\b",
+    re.I)
+_METRIC_KEYS = {"income": "income", "treasury": "treasury", "gold": "treasury",
+                "money": "treasury", "upkeep": "upkeep", "public order": "public_order",
+                "growth": "growth", "control": "control", "corruption": "corruption"}
+
+
+def _metric_query(message):
+    """A bare/short factual query naming a state metric with no act marker — the caller only
+    uses this when `not may_act` already, so an order that happens to mention "income"
+    ("build something for income") is never intercepted here."""
+    low = " ".join((message or "").lower().split()).strip(" ?!.")
+    stripped = " ".join(_METRIC_FILLER_RE.sub(" ", low).split())
+    return _METRIC_KEYS.get(stripped)
+
+
+def _state_metric_fact(state, metric):
+    """The real number for a faction-wide metric, or None for a per-region one (public
+    order/growth/control/corruption vary by region — no single faction figure to state, but
+    the prompt already renders them per region, so the note points there instead)."""
+    if metric == "income":
+        return f"income is {state.get('income', '?')} gold/turn, net {state.get('net_income', '?')}"
+    if metric == "treasury":
+        return f"treasury is {state.get('treasury', '?')} gold"
+    if metric == "upkeep":
+        uip = state.get("upkeep_income_percent")
+        return (f"upkeep is {uip}% of income" if isinstance(uip, (int, float))
+                else "upkeep isn't in this state dump")
+    return None
+
+
+def _already_sent_phrasing(base_desc, message):
+    """The tail of an "already sent" SYSTEM NOTE. Plain by default. When the player's
+    message pushes back — "not", "isn't", "didn't", "no", "wrong" — the model is told to
+    acknowledge the disagreement, explain the order already left this turn and will show in
+    the settlement's build queue next time the panel refreshes, and offer to send it again
+    only if he says so next turn, instead of just repeating "already sent" (real-Gemini
+    replay wording bounce, 2026-09-16)."""
+    if _PUSHBACK_RE.search(" ".join((message or "").lower().split())):
+        return (base_desc + "; he seems to disagree — acknowledge that, explain the order "
+                "already left this turn and will show in the settlement's build queue next "
+                "time the panel refreshes, and offer to send it again only if he says so "
+                "next turn")
+    return base_desc + "; tell him it was already sent, do not send it again"
+
+
+def _offer_note(cid, turn, rules, candidates, context):
+    """Build the SYSTEM NOTE for 'present these options, best first' and remember exactly
+    what was offered (capped, in this order) so a later pick resolves unambiguously.
+
+    A single-item offer ends with "Say yes to order it" instead of "Pick one by number" —
+    there is nothing to number when only one option exists (real-Gemini replay wording
+    bounce, 2026-09-16)."""
+    offered = list(candidates[:MAX_OFFERED_OPTIONS])
+    remember_options(cid, turn, offered)
+    lines = [f"{i + 1}) {_describe_option(rules, u)}" for i, u in enumerate(offered)]
+    invite = ("Say yes to order it." if len(offered) == 1
+              else "Pick one by number.")
+    return (context + " Present exactly these options to him, numbered exactly as listed, "
+            "best first, in your own words — never invent, guess, or reorder them:\n" +
+            "\n".join(lines) +
+            f"\nEnd with one short line inviting him to respond: {invite} Issue no "
+            "building command until he does.")
+
+
+def remember_options(cid, turn, options):
+    global _PENDING_OPTIONS
+    if isinstance(cid, str) and isinstance(turn, int) and options:
+        _PENDING_OPTIONS = {"campaign_id": cid, "turn": turn, "options": list(options)}
+
+
+def pending_options(cid, turn):
+    """The list Alfred just offered, if it's still this exact campaign+turn — a stale list
+    (an earlier turn, or a different campaign) is discarded, never guessed against."""
+    global _PENDING_OPTIONS
+    pending = _PENDING_OPTIONS
+    if not pending:
+        return None
+    if pending["campaign_id"] != cid or pending["turn"] != turn:
+        _PENDING_OPTIONS = None
+        return None
+    return pending["options"]
+
+
+# The last single building candidate chat() decided on THIS turn — whether it fired, or was
+# already sent — so a vague follow-up ("rerun it", "no its not queue") that narrows to
+# nothing new can still be told "already sent" instead of a fresh numbered list. Bounce
+# review, real Gemini replay: after an order went through, "rerun it" re-printed the
+# numbered list instead of saying the thing it clearly meant was already done.
+_LAST_SINGLE_CANDIDATE = None
+
+
+def remember_last_candidate(cid, turn, u):
+    global _LAST_SINGLE_CANDIDATE
+    if isinstance(cid, str) and isinstance(turn, int):
+        _LAST_SINGLE_CANDIDATE = {"campaign_id": cid, "turn": turn, "region": u["region"],
+                                   "slot_idx": u["slot_idx"], "building": u["building"]}
+
+
+def last_candidate(cid, turn):
+    p = _LAST_SINGLE_CANDIDATE
+    if not p or p["campaign_id"] != cid or p["turn"] != turn:
+        return None
+    return p
+
+
+_ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+
+# Filler that wraps a direct order/confirmation/pick without changing what it means — "do it
+# NOW", "JUST do it", "OK do it", "YES, do the second", "go for it PLS". Box 13 follow-up
+# (coordinator, item 1): the plain forms already worked; these did not, because
+# _QUESTION_OVERRIDE_RE/_SOLE_OPTION_CONFIRM_RE/_PICK_NUMBER_RE all matched the WHOLE message
+# with no room for a leading/trailing pleasantry.
+_CONFIRM_WRAP_LEAD_RE = re.compile(r"^(?:just|ok|okay|yes)[,\s]+", re.I)
+_CONFIRM_WRAP_TAIL_RE = re.compile(r"\s+(?:now|please|pls)$", re.I)
+
+
+def _strip_confirm_wrapper(low):
+    """Strip one leading 'just'/'ok'/'okay'/'yes[,]' and one trailing 'now'/'please'/'pls'
+    from an already-lowercased, whitespace-normalized message. Used ONLY to decide whether a
+    message IS a direct order/confirmation/pick — never to build player-facing text."""
+    out = _CONFIRM_WRAP_LEAD_RE.sub("", low, count=1)
+    out = _CONFIRM_WRAP_TAIL_RE.sub("", out, count=1)
+    return out
+
+
+# The whole (normalized) message must match one of: a bare number/ordinal, or one of these
+# small lead-in phrases followed by a number/ordinal, with only "one" and/or "please" allowed
+# to trail. Anything else around the number means it wasn't a pick.
+#
+# "no, " is a lead-in too (box 13, real-Gemini pass 2, finding #4): "no, the second one" is an
+# AFFIRMATION of a choice ("no [not what I said before], [I mean] the second one"), not a
+# refusal — "no" alone, or "no" followed by anything that isn't a number/ordinal phrase (e.g.
+# "no, don't"), still falls through to None here exactly as before, since the comma-plus-pick
+# shape is the only thing this adds.
+# "do the second"/"do 2" are pick lead-ins too (box 13, item 0: `_is_question`'s override
+# whitelists these as orders, not questions — this is what then resolves WHICH one).
+_PICK_LEAD = (r"(?:the\s+|option\s*#?\s*|number\s*#?\s*|#\s*|lets\s+do\s+|let's\s+do\s+|"
+              r"go\s+with\s+|take\s+(?:the\s+)?|no,\s+(?:the\s+)?|do\s+(?:the\s+)?)?")
+_PICK_TAIL = r"(?:\s+one)?(?:\s+please)?"
+_PICK_NUMBER_RE = re.compile(
+    _PICK_LEAD + r"(?:(\d+)(?:st|nd|rd|th)?|(first|second|third|fourth|fifth))" + _PICK_TAIL)
+
+
+def _extract_pick_number(message):
+    """The plain 1-based number a message seems to be picking, regardless of whether it is
+    in range — used both to resolve a pick and to catch an OUT-OF-RANGE one ("2" with only
+    one option offered), so Alfred can say so instead of silently doing something else, or
+    silently doing nothing.
+
+    MEASURED 2026-09-16 (bounce review, round 2): the previous version was a bare
+    `\\b(\\d+)\\b` search anywhere in the message, so "build 2 farms" or "what about slot 2"
+    picked option 2 by accident. Fixed to require the digit to BE the whole message, or
+    immediately follow "option"/"number"/"#" with nothing after it.
+
+    MEASURED 2026-09-16 (bounce review, round 3): ordinal WORDS ("first", "second", "1st")
+    were still matched anywhere in the message with `re.search`, so "first i need money" and
+    "second, what about walls" issued real builds while an offer was pending. Ordinals now
+    get the same whole-message discipline as digits: the entire (normalized) message must be
+    a bare number/ordinal, or one of a short list of natural lead-ins ("option 2 please",
+    "lets do 2", "go with 2", "take the first", "the second one") — never a number or ordinal
+    sitting inside an unrelated sentence."""
+    low = " ".join((message or "").lower().split())
+    stripped = _strip_confirm_wrapper(low.strip(" ?!."))
+    m = _PICK_NUMBER_RE.fullmatch(stripped)
+    if not m:
+        return None
+    if m.group(1):
+        return int(m.group(1))
+    return _ORDINAL_WORDS[m.group(2)]
+
+
+_SOLE_OPTION_CONFIRM_RE = re.compile(
+    r"^(?:yes|yep|yeah|yup|go|ok|okay|sure|confirm|y|do\s+it|do\s+that|go\s+for\s+it)$", re.I)
+
+
+def _parse_pick(message, options):
+    """A bare number ("2"), "option 2", an ordinal word/suffix ("the second", "1st"), or a
+    message that names exactly one offered option, resolved to its 0-based index — or None
+    when nothing in `options` is clearly meant, OR the picked number is out of range (the
+    caller checks that separately via _extract_pick_number, to report "no option N" rather
+    than silently falling through)."""
+    if not options:
+        return None
+    n = _extract_pick_number(message)
+    if n is not None:
+        return n - 1 if 1 <= n <= len(options) else None
+    low = " ".join((message or "").lower().split())
+    # "do it"/"do that"/"go for it" (and the plain bare confirmations) name no number, so
+    # they can only ever resolve when there's exactly ONE thing they could mean.
+    if len(options) == 1 and _SOLE_OPTION_CONFIRM_RE.match(
+            _strip_confirm_wrapper(low.strip(" .!"))):
+        return 0
+    # COST VOCABULARY: "the cheap one"/"the cheapest" is unambiguous — resolve to whichever
+    # offered option actually costs least. "the expensive one"/"the best one" is deliberately
+    # NOT handled here: "best" is subjective (not literally the highest-priced option) and
+    # resolving it would be a guess dressed up as a pick, so those fall through to None and
+    # the caller re-lists instead.
+    if re.search(r"\bcheap(?:est)?\b", low):
+        return min(range(len(options)), key=lambda i: options[i].get("cost") or 0)
+    hits = [i for i, u in enumerate(options)
+            if (u.get("name") and u["name"].lower() in low)
+            or u["building"].replace("_", " ").lower() in low]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _find_option(ups, u):
+    """The CURRENT legal dict matching a remembered option's triple, or None if the state
+    moved on and it's no longer legal (slot filled, turn advanced, funds changed the list)."""
+    return next((x for x in ups if x["region"] == u["region"]
+                 and x["slot_idx"] == u["slot_idx"] and x["building"] == u["building"]), None)
+
+
 def chat_prompt_intent(message):
     """Select a render-only chat view; unknown or mixed requests keep every option."""
     low = " ".join((message or "").lower().split())
@@ -2964,114 +3462,25 @@ CAP_PHRASE = re.compile(
     r"\b(enable|disable|turn on|turn off|allow|stop)\b[^.]{0,30}?\b(buildings?|skills?)\b")
 
 
-# ---------------------------------------------------------------- the TARS sliders
+# ---------------------------------------------------------------- tone (was: the TARS sliders)
 #
-# Owner ruling 2026-09-01: "remember the sliders like that. use the interstellar sliders",
-# then "there should be a slider menu in the mct mod configuration area". All four were TARS's
-# own, confirmed by search after he pushed back on a two-slider claim from memory: honesty
-# (90, reset to 95 in the repair scene), humour (75, dialled to 60), discretion (TARS offers a
-# cue light for jokes) and trust ("What's your trust setting, TARS?" / "Lower than yours
-# apparently"). An earlier proposal of mine added "autonomy"; it was dropped because trust
-# already means it, and inventing a slider TARS does not have while calling them the
-# Interstellar sliders is the kind of quiet drift this file exists to prevent.
+# Owner ruling 2026-09-01 on: trust+discretion -> authority (Box F); 2026-09-05: humour
+# removed (Box H); 2026-09-16: authority removed (alfred-20260916-question-never-acts),
+# leaving honesty as the last slider. 2026-09-17 (alfred-20260917-no-sliders-strip-bloat),
+# owner verbatim: "just remove all sliders for now". Honesty is gone the same way the rest
+# went: not read from anywhere, not on the MCT page, not settable in chat. An old prefs.json
+# or an older pack's dump carrying a "sliders" key (honesty or any earlier name) loads fine
+# and the key is simply never read — no code anywhere still looks for it.
 #
-# BOX F, owner ruling 2026-09-01 22:30, verbatim: "trust and discretion seem redundant came be
-# made authority essentirally". Read as: collapse the two into ONE slider, "authority" — it
-# now does what trust did (drives allow_commands) AND what discretion did (how much Alfred
-# narrates). Two sliders remain: authority, honesty.
-#
-# BOX H, 2026-09-05, owner ruling: "also the humour slider doesnt work just remove that
-# slider". The VALUE reached the daemon fine (a dump held humour 60); the tone never landed
-# in his replies. Ruling is remove, not fix — humour is gone from the slider model, the MCT
-# page, the prompt, and the chat "set humour N" alias.
-#
-# A slider is a NUMBER, 0-100, owned and clamped by the daemon — never free text. That is not
-# a new rule: preferences are a daemon-owned enum precisely because chat history enters the
-# prompt VERBATIM, so a stored free-text preference is durable prompt injection. A number
-# cannot carry an instruction.
-#
-# WHAT EACH ONE IS ALLOWED TO MOVE. Only authority has teeth:
-#   authority — how explicit the player must be before Alfred acts, AND how much he narrates.
-#                Drives allow_commands, which can only ever SUBTRACT commands; at authority
-#                100 it subtracts nothing, and it still cannot add anything validate() would
-#                refuse. The narration half is tone only.
-#   honesty   — how bluntly a bad plan is called bad. TONE ONLY (see HARD_TRUTHS).
-SLIDER_DEFAULTS = {
-    "authority": 50,    # trust's old default — authority inherits trust's teeth
-    "honesty": 90,      # TARS's own setting when Cooper asks
-}
-
-# The carve-out, and it is the whole reason honesty is safe to expose. Dialling honesty down
-# must never turn "this is a loss" into "a long-term investment" — that is exactly the failure
-# the payback rule exists to prevent, arrived at from the other side. These are stated plainly
-# at honesty 0 exactly as at 100; the slider moves how gently everything ELSE is put.
+# Tone is now ONE FIXED LINE (see TONE_LINE below): honest and direct, never softens a hard
+# truth. HARD_TRUTHS is kept — it is not slider machinery, it is the standing carve-out that
+# a bad plan is always called out regardless of tone.
 HARD_TRUTHS = ("a payback longer than the campaign horizon", "a spend that breaches the "
                "reserve floor", "a build the game will refuse")
 
-# How authority changes what counts as permission. Bands, not a curve: the gate is a yes/no
-# and a threshold that moved continuously would be untestable and unexplainable to the owner.
-# Named AUTHORITY_* (were TRUST_EXPLICIT/TRUST_STANDING before Box F).
-AUTHORITY_EXPLICIT = 34   # below this, only an unambiguous instruction ("build X", "do it") acts
-AUTHORITY_STANDING = 67   # at/above this, a request for a recommendation is itself permission
-
-
-def clamp_sliders(got):
-    """Coerce anything into three ints in 0-100. Applied on READ as well as on write, so a
-    hand-edited prefs file, an older schema, or a value arriving from the MCT page cannot put
-    an out-of-range or non-numeric setting into the gate.
-
-    BOX F LEGACY COMPAT: an old prefs.json or an older pack's dump used "trust" for what is
-    now "authority", and carried a separate "discretion" that authority now also covers.
-    "trust" is read into "authority" when the caller has not already sent the new key;
-    "discretion" is silently dropped (the loop below only ever reads SLIDER_DEFAULTS keys, so
-    an unmapped legacy key can never reach a gate on its own).
-
-    BOX H LEGACY COMPAT (2026-09-05): "humour" is gone the same way "discretion" is — an old
-    prefs.json or an older pack's dump carrying it is silently dropped by the same mechanism."""
-    out = dict(SLIDER_DEFAULTS)
-    if not isinstance(got, dict):
-        return out
-    src = got
-    if "authority" not in got and "trust" in got:
-        src = dict(got)
-        src["authority"] = got["trust"]
-    for k in SLIDER_DEFAULTS:
-        v = src.get(k)
-        if isinstance(v, bool):       # bool is an int in Python; "authority: true" is not a 1
-            continue
-        if isinstance(v, (int, float)):
-            out[k] = max(0, min(100, int(v)))
-    return out
-
-
-def slider_lines(sliders):
-    """The disposition block for the prompt. Short lines — the sweep prompt has a hard-won
-    token budget, so this states the setting and its consequence, nothing more."""
-    s = clamp_sliders(sliders)
-    out = [f"YOUR SETTINGS (the player sets these; honour them): authority {s['authority']}, "
-           f"honesty {s['honesty']}."]
-    out.append("Honesty is how bluntly you judge a plan, NOT whether you mention a problem: "
-               + "always state " + ", ".join(HARD_TRUTHS)
-               + ", plainly, at every honesty setting.")
-    if s["honesty"] >= 80:
-        out.append("High honesty: say plainly when a plan is bad and why, including when the "
-                   "player proposed it.")
-    elif s["honesty"] <= 40:
-        out.append("Low honesty: be gentle about weak plans — but the hard truths above are "
-                   "stated regardless, never softened away.")
-    # BOX F: authority now carries what discretion used to (how much he narrates unprompted)
-    # alongside what trust did (act-gate bands, in allow_commands below).
-    if s["authority"] >= 67:
-        out.append("High authority: act on a standing request, and report only what "
-                   "matters — do not narrate routine moves.")
-    elif s["authority"] <= 33:
-        out.append("Low authority: wait for an explicit instruction, and say what you are "
-                   "doing and why, including routine moves.")
-    return out
-
-
-SLIDER_PHRASE = re.compile(
-    r"\b(authority|trust|honesty)\b\D{0,20}?(\d{1,3})\b")
+TONE_LINE = ("Be honest and direct. Always state plainly, never softened: " +
+             ", ".join(HARD_TRUTHS) + ". Narrate moderately: report what matters — a real "
+             "choice, a risk, a spend — without a line for every routine move.")
 
 
 STANCES = {
@@ -3090,6 +3499,40 @@ STANCE_PHRASES = {
     "hold cash": "hold", "stop spending": "hold", "save money": "hold",
     "no preference": "balanced", "balanced": "balanced",
 }
+
+# A question mark, a leading WH/aux word, or a "worth it"-shaped phrase anywhere. WIDENED
+# 2026-09-16 (real-Gemini replay, box 13 item 0): the old leading list was just
+# what/which/who/when/why/how plus a few exact multi-word phrases, so mark-less phrasings
+# like "is the elven workshop worth it" and "whats my public order like" — neither starting
+# with a listed word nor carrying a "?" — fell all the way through to `allow_commands` reading
+# their act marker ("build"/"buy" is never IN these two messages, but the single-legal-option
+# and purpose-narrowing shortcuts don't require one) and spent real gold on a pure question.
+# Bare leading aux words (is/are/do/does/did/can/could/should/would/will/shall) now count too
+# — they used to be deliberately excluded because "do it"/"go ahead" collide with them, which
+# is what _QUESTION_OVERRIDE_RE below exists to carve back out.
+_QUESTION_RE = re.compile(
+    r"\?|^\s*(what's|whats|what|which|who's|whos|who|when|where|why|how's|hows|how|"
+    r"is|are|am|was|were|do|does|did|can|could|should|would|will|shall|any|"
+    r"tell\s+me|explain|show\s+me)\b"
+    r"|\b(worth\s+it|worth\s+building|good\s+idea|any\s+point)\b", re.I)
+
+# A message that LOOKS like it starts with a question word but is actually a direct order or
+# confirmation — "do it", "do that", "do the second", "do 2", "do both", "go for it". Matched
+# against the WHOLE (normalized) message only, so a question that merely contains one of these
+# words ("do you think I should do it eventually?") never slips past the question rule.
+_QUESTION_OVERRIDE_RE = re.compile(
+    r"^(?:do\s+(?:it|that|both|the\s+(?:first|second|third|fourth|fifth|\d+)|\d+)"
+    r"|go\s+for\s+it)\s*[.!]?$", re.I)
+
+
+def _is_question(message):
+    low = " ".join((message or "").lower().split()).strip(" .!")
+    # box 13 follow-up, item 1: "do it now"/"just do it"/"ok do it"/"go for it pls" are the
+    # SAME override, just wrapped in a pleasantry the un-stripped match couldn't see through.
+    if _QUESTION_OVERRIDE_RE.match(_strip_confirm_wrapper(low)):
+        return False
+    return bool(_QUESTION_RE.search(low))
+
 
 # Words that mean "do it", as opposed to "tell me about it". See allow_commands.
 ACT_MARKERS = (
@@ -3115,7 +3558,6 @@ ACT_CONFIRMATIONS = ("yes", "yep", "yeah", "yup", "go", "ok", "okay", "sure", "c
 def load_prefs(cid):
     """Preferences for one campaign. Fails soft, and refuses to serve another campaign's."""
     out = {"stance": "balanced", "reserve_floor": RESERVE_FLOOR_MIN,
-                       "sliders": dict(SLIDER_DEFAULTS),
                        "capabilities": dict(CAP_DEFAULTS)}
     if cid is None:
         return out
@@ -3130,7 +3572,9 @@ def load_prefs(cid):
             out["stance"] = got["stance"]
         if isinstance(got.get("mct_seen"), dict):
             out["mct_seen"] = got["mct_seen"]
-        out["sliders"] = clamp_sliders(got.get("sliders"))
+        # "sliders" (honesty, or any earlier slider name) is read from neither an old
+        # prefs.json nor a dumped settings blob any more — the key loads fine and is simply
+        # ignored (alfred-20260917-no-sliders-strip-bloat).
         out["capabilities"] = clamp_caps(got.get("capabilities"))
         rf = got.get("reserve_floor")
         # RAISE-ONLY, enforced on read as well as on write: a hand-edited file must not be
@@ -3174,8 +3618,6 @@ def apply_pref_phrases(cid, message, prefs):
             break
     # 1-7 digits, not 3-7: "set the floor to 0" is exactly the instruction that must be
     # recognised and REFUSED out loud, and a 3-digit minimum silently ignored it instead.
-    # "keep" is a floor word only when it is about the floor: "keep honesty at 90" used to
-    # answer "I can raise the reserve floor but not lower it below 1500" at a slider command.
     m = re.search(r"(?:reserve|floor|keep\s+(?:the\s+)?(?:floor|reserve))\D{0,20}?(\d{1,7})",
                   low)
     if m:
@@ -3187,22 +3629,7 @@ def apply_pref_phrases(cid, message, prefs):
             note = ((note + " ") if note else "") + (
                 f"I can raise the reserve floor but not lower it below "
                 f"{RESERVE_FLOOR_MIN} — leaving it at {new['reserve_floor']}.")
-    # THE SLIDERS, recognised in Python exactly like the stance and the floor above. The model
-    # is never asked what the player meant, so it cannot be talked into moving its own
-    # authority setting — which is the one preference that would widen a gate.
-    sl = dict(clamp_sliders(new.get("sliders")))
-    moved = []
-    for m in SLIDER_PHRASE.finditer(low):
-        g1 = m.group(1)
-        # "trust" is still recognised in chat (Box F legacy compat) and maps to authority.
-        key = "authority" if g1 in ("authority", "trust") else g1
-        want = max(0, min(100, int(m.group(2))))
-        if sl.get(key) != want:
-            sl[key] = want
-            moved.append(f"{key} {want}")
-    if moved:
-        new["sliders"] = sl
-        note = ((note + " ") if note else "") + "Set: " + ", ".join(moved) + "."
+    # No sliders left to recognise from chat (alfred-20260917-no-sliders-strip-bloat).
 
     # THE CAPABILITY CHECKBOXES. Same deterministic treatment, and deliberately narrow: the
     # MCT page is the real surface for these, this exists so he can say it in the chat window
@@ -3226,36 +3653,31 @@ def apply_pref_phrases(cid, message, prefs):
 
 
 def apply_dumped_settings(cid, state, prefs):
-    """Take the harness controls from the state dump, if the player moved one.
+    """Take the harness controls (capability checkboxes) from the state dump, if the player
+    moved one.
 
-    TWO WRITERS, ONE OWNER. He can set a slider in the MCT menu or say it in chat, and both
+    TWO WRITERS, ONE OWNER. He can set a checkbox in the MCT menu or say it in chat, and both
     must work without fighting. The rule: PREFS ARE THE VALUE, the dump is an EVENT. A dumped
-    setting is applied only when it DIFFERS from what the dump last said — so moving a slider
-    in the menu changes it, while a menu that keeps reporting its unchanged default does not
-    overwrite something set in chat five minutes ago. Without that, every dump would silently
-    revert a chat command, which is the kind of bug that looks like the model ignoring you.
+    setting is applied only when it DIFFERS from what the dump last said — so moving a
+    checkbox in the menu changes it, while a menu that keeps reporting its unchanged default
+    does not overwrite something set in chat five minutes ago. Without that, every dump would
+    silently revert a chat command, which is the kind of bug that looks like the model
+    ignoring you.
 
-    Everything is re-clamped: clamp_sliders and clamp_caps run on whatever arrives, so a
-    modded or older MCT cannot put a junk value into a gate. MCT is an input surface, never
-    the authority — the standing rule for this harness.
+    Everything is re-clamped: clamp_caps runs on whatever arrives, so a modded or older MCT
+    cannot put a junk value into a gate. MCT is an input surface, never the authority — the
+    standing rule for this harness.
     """
     got = (state or {}).get("settings")
     if not isinstance(got, dict):
         return prefs, None
     seen = prefs.get("mct_seen") or {}
-    new_sl = clamp_sliders(got.get("sliders"))
+    # "sliders" in a dump (this pack's or an older one's) is not read here any more — no
+    # slider gate exists to apply it to (alfred-20260917-no-sliders-strip-bloat).
     new_cp = clamp_caps(got.get("caps"))
-    old_sl = clamp_sliders(seen.get("sliders"))
     old_cp = clamp_caps(seen.get("caps"))
     changed = []
     out = dict(prefs)
-    if new_sl != old_sl:
-        cur = clamp_sliders(out.get("sliders"))
-        for k, v in new_sl.items():
-            if v != old_sl.get(k) and v != cur.get(k):
-                cur[k] = v
-                changed.append(f"{k} {v}")
-        out["sliders"] = cur
     if new_cp != old_cp:
         cur = clamp_caps(out.get("capabilities"))
         for k, v in new_cp.items():
@@ -3267,7 +3689,7 @@ def apply_dumped_settings(cid, state, prefs):
     # by the per-key guard above (because it already matched the current pref) must still
     # update "last seen", or a LATER genuinely-changed dump gets compared against a stale
     # snapshot and reverts a chat command with an untouched menu (F2).
-    out["mct_seen"] = {"sliders": new_sl, "caps": new_cp}
+    out["mct_seen"] = {"caps": new_cp}
     if not changed:
         if out.get("mct_seen") != seen:
             save_prefs(cid, out)
@@ -3284,6 +3706,23 @@ def effective_floor(state, prefs):
     if isinstance(dumped, int):
         floors.append(dumped)
     return max(floors)
+
+
+def affordable(ups, state, prefs):
+    """The subset of `ups` chat() may actually OFFER or auto-issue this turn — same floor
+    validate() enforces (effective_floor). Bounce fix, 2026-09-17
+    (alfred-20260917-faction-rules-affordability, box 16): build_prompt's own render only
+    trims the province/UPGRADE/NEW catalog text; chat()'s numbered pick list (_offer_note)
+    and its single-candidate auto-issue path both still worked off the UNFILTERED `ups` —
+    so a 2500g option on a 1500g budget was still numbered "1) ..." and told to the model
+    verbatim, and a lone unaffordable candidate was auto-issued with only validate() left to
+    catch it. Callers use this result ONLY for what to present/issue; `ups`/`legal` handed to
+    validate()/_find_option stays the full, unfiltered set, so a NAMED pick of a legal-but-
+    over-budget option still gets the real reserve-floor reason via the existing FALSE_CLAIM
+    re-ask instead of a silent "not enumerated" drop."""
+    floor = effective_floor(state, prefs)
+    budget = (state.get("treasury") or 0) - floor
+    return [u for u in ups if u["cost"] <= budget]
 
 
 # Words that REVERSE an instruction. Without these the gate reads a refusal as permission.
@@ -3319,7 +3758,22 @@ def _acts_unnegated(low):
 
     Conservative by design: when every marker is negated this returns False, and the worst
     that costs is Alfred answering instead of spending, which this gate's docstring already
-    accepts. It can still only ever SUBTRACT."""
+    accepts. It can still only ever SUBTRACT.
+
+    DIRECT BINDING NARROWED (2026-09-16, coordinator follow-up item 4, real-Gemini pass 3):
+    "no gold left, build the farm" did not act — the old 4-word lookback found "no" three
+    words back and read it as refusing "build", when "no" is really a determiner on "gold"
+    ("no gold left"), not a refusal at all. A negator now binds a marker DIRECTLY only when
+    it is the LAST negator before the marker in its clause AND nothing — a comma, "so", or
+    more than 3 words — sits between the negator and the marker. "no gold left, build the
+    farm" now acts (the comma breaks "no"'s reach); "no, build the farm" now acts too (the
+    comma right after "no" reads as rejecting something else, same as "no, the second one"
+    elsewhere reads as an affirmed pick, not a refusal); "dont build the farm" still doesn't
+    (nothing breaks the binding). Clause-scoped PROPAGATION — a negation carrying forward to
+    a LATER, un-preceded marker in the same clause ("don't build the farm, build the
+    barracks") — is separate and unchanged; only the direct-binding half of the check is
+    narrowed."""
+    low = low.replace("'", "").replace("’", "")  # once, so "don't" matches the "dont" negator
     neg = "|".join(n.replace(" ", r"\s+") for n in NEGATORS)
     hits = []
     for m in ACT_MARKERS:
@@ -3330,22 +3784,29 @@ def _acts_unnegated(low):
     for i, (st, en) in enumerate(hits):
         lo = max(prev_end, st - 40)
         # A clause break also ENDS the lookback, not just the carried refusal. Otherwise the
-        # four-word window reads "no farm; upgrade the port" as a refusal to upgrade, because
-        # "no" is two words back across the semicolon. Same rule, applied consistently: a
-        # refusal does not survive its own clause.
+        # window reads "no farm; upgrade the port" as a refusal to upgrade, because "no" is
+        # two words back across the semicolon. Same rule, applied consistently: a refusal
+        # does not survive its own clause.
         brk = [m.end() for m in re.finditer(CLAUSE_BREAK, low[:st])]
         if brk:
             lo = max(lo, brk[-1])
-        # apostrophes stripped for this check only: "don't" must match the negator "dont",
-        # and \b does not cross an apostrophe.
-        tail = " ".join(low[lo:st].split()[-4:]).replace("'", "").replace("’", "")
-        negated = bool(re.search(r"\b(" + neg + r")\b", tail))
-        # NEGATION SCOPES TO THE CLAUSE. A four-word lookback alone let the second verb of a
-        # conjoined refusal walk free — "don't build or upgrade anything" negated `build` and
-        # acted on `upgrade`. Chaining across bare conjunctions fixed that pair but not
-        # "never build or recruit or spend", because `recruit` is not a marker and broke the
-        # chain. Rather than keep adding words to a pattern — which is writing a parser badly
-        # — the refusal now simply RUNS UNTIL A CLAUSE ENDS.
+        seg = low[lo:st]
+        # DIRECT CHECK: the CLOSEST negator to this marker within its clause, binding only
+        # if nothing separates it from the marker — a comma, "so", or more than 3 words.
+        neg_hits = list(re.finditer(r"\b(" + neg + r")\b", seg))
+        negated = False
+        if neg_hits:
+            between = seg[neg_hits[-1].end():]
+            if ("," not in between and not re.search(r"\bso\b", between)
+                    and len(between.split()) <= 3):
+                negated = True
+        # NEGATION SCOPES TO THE CLAUSE (propagation, separate from the direct check above).
+        # A four-word lookback alone let the second verb of a conjoined refusal walk free —
+        # "don't build or upgrade anything" negated `build` and acted on `upgrade`. Chaining
+        # across bare conjunctions fixed that pair but not "never build or recruit or spend",
+        # because `recruit` is not a marker and broke the chain. Rather than keep adding words
+        # to a pattern — which is writing a parser badly — the refusal simply RUNS UNTIL A
+        # CLAUSE ENDS, and a comma is NOT a clause break for this half of the check.
         #
         # DELIBERATE CONSEQUENCE, stated rather than discovered: "don't build the farm, build
         # the barracks" no longer acts. A comma is not a clause boundary here, so the whole
@@ -3361,44 +3822,38 @@ def _acts_unnegated(low):
     return False
 
 
-def allow_commands(message, authority=None):
-    """Did the player actually ask Alfred to DO something?
+def allow_commands(message):
+    """Did the player actually ask Alfred to DO something, for the BUILDINGS path (chat()'s
+    skill path has its own separate act-gate and is unaffected by this function)?
 
     This rule existed only inside CHAT_SYSTEM — a sentence in a prompt, which a stored
     preference or a persuasive message could argue against. It is a Python gate now, and it
     can only ever SUBTRACT commands: a sweep is inherently an instruction to act and is not
     routed through here, so the worst this does is make Alfred answer instead of spending.
 
-    AUTHORITY (was TRUST before Box F) moves where the bar sits, in three BANDS rather than
-    along a curve. A continuously moving threshold would be untestable and impossible to
-    explain; a band is a sentence. The invariant holds at every setting: this never CREATES a
-    command, it only decides whether to keep ones the model already produced, and validate()
-    still refuses anything illegal, unaffordable, below the reserve floor, or in an unchecked
-    capability. Authority 100 is not permission to overspend — it is permission to not be
-    asked.
+    A QUESTION IS NEVER AN ORDER, full stop (2026-09-16 ruling, alfred-20260916-question-
+    never-acts, owner verbatim: "Just answer. No a question is a question. Remove authority
+    slider for now") — not via a bare act-marker substring landing inside it ("what should i
+    build next?" contains "build"), not via a bare confirmation word landing inside it
+    ("should i go with the plaza?" contains "go"), and not via anything else: there used to
+    be an authority slider whose high band treated a recommendation-question as standing
+    permission to act; it is gone, along with that exception. A question about buildings
+    always gets an answer (and, when it names or narrows to a legal option, an offer to act
+    on it — see chat()'s numbered-options path), never a command on its own.
 
-      < 34   explicit instruction only ("build the barracks", "do it"). A bare "yes" is not
-             enough: the setting for someone who wants to approve every move in words.
-      34-66  explicit OR a bare confirmation. Today's behaviour, and the default.
-      >= 67  also acts on a request for a recommendation — "what should I build?" is taken as
-             "and get on with it". A plain factual question is still only answered.
+    Otherwise: an explicit instruction ("build the barracks", "do it") or a bare confirmation
+    ("yes", "go") acts; anything else does not. The invariant holds regardless: this never
+    CREATES a command, it only decides whether to keep ones the model already produced, and
+    validate() still refuses anything illegal, unaffordable, below the reserve floor, or in
+    an unchecked capability.
     """
+    if _is_question(message):
+        return False
     low = " ".join((message or "").lower().split())
-    t = (clamp_sliders({"authority": authority})["authority"] if authority is not None
-         else SLIDER_DEFAULTS["authority"])
     if _acts_unnegated(low):
         return True
-    if t < AUTHORITY_EXPLICIT:
-        return False
     words = set(re.findall(r"[a-z']+", low))
-    if any(c in words for c in ACT_CONFIRMATIONS):
-        return True
-    if t >= AUTHORITY_STANDING:
-        # Only forms that ASK FOR A CHOICE. "what should i build" is an instruction at high
-        # authority; "what is my income" is a question at every authority and must stay one —
-        # the difference is the modal verb, so match that rather than the question word alone.
-        return bool(re.search(r"\b(what|which|where)\b[^?]{0,40}\b(should|would|do)\b", low))
-    return False
+    return any(c in words for c in ACT_CONFIRMATIONS)
 
 
 # ---------------------------------------------------------------- B6: campaign journal
@@ -3747,16 +4202,192 @@ def parse_chat_request(text):
     return token, rest
 
 
-def _issued_summary(cmds):
+def _issued_summary(cmds, rules=None):
+    """Player-facing status line — display names only, never raw keys (2026-09-16). "Issued"
+    means the order was SENT to the game this turn, not that it completed: the mod confirms
+    each command asynchronously (aigen_log.txt), so this line never claims done.
+
+    Nothing-issued no longer gets a line here: the model already says so, in its own words,
+    and a second Python-authored "No orders issued." on top of that was itself the doubled-
+    text bug on a different sentence (chat() now calls this ONLY when cmds is non-empty)."""
     if not cmds:
-        return "No orders issued."
+        return ""
+    levels = ((rules or {}).get("buildings") or {}).get("levels") or {}
     parts = []
     for c in cmds:
         if c["kind"] == "skill":
-            parts.append(f"skill {c['skill']} for cqi {c['cqi']}")
+            parts.append(f"skill {_skill_label(c['skill'])} for cqi {c['cqi']}")
         elif c["kind"] == "building":
-            parts.append(f"building {c['building']} at {c['region']} slot {c['slot_idx']}")
+            bname = (levels.get(c["building"]) or {}).get("name") or c["building"]
+            parts.append(f"building {bname} at {_region_name(rules, c['region'])} "
+                         f"slot {c['slot_idx']}")
     return "Issued: " + "; ".join(parts) + "."
+
+
+def _narrow_by_target(message, rules, ups):
+    """Advisory narrowing: when the message plainly names a settlement or a building, point
+    the model at the one legal option that matches instead of leaving it to guess among many.
+
+    Never makes anything MORE legal — it only picks a subset of an already-legal `ups` list —
+    so a false match costs nothing worse than a wasted hint; validate() still checks the
+    model's actual output against the full `ups` it was given.
+
+    ponytail: substring matching, not tokenised or fuzzy — good enough for a display name or
+    a settlement mentioned by name; add real matching if short/generic names start colliding."""
+    low = " ".join((message or "").lower().split())
+    if not low or len(ups) <= 1:
+        return ups
+    def mentioned(u):
+        for name in (u.get("name"), u["building"].replace("_", " "),
+                     _region_name(rules, u["region"])):
+            if name and name.lower() in low:
+                return True
+        return False
+    hit = [u for u in ups if mentioned(u)]
+    return hit or ups
+
+
+def _delint_keys(rules, state, text):
+    """CHAT_SYSTEM already tells the model to use display names, never internal keys — this
+    is the enforcement, since a system prompt is a request the model can still miss. Swaps
+    any building/region key that leaked into reply text for its display name."""
+    if not text:
+        return text
+    levels = (rules.get("buildings") or {}).get("levels") or {}
+    keymap = {}
+    for k, v in levels.items():
+        name = (v or {}).get("name")
+        if name and name != k:
+            keymap[k] = name
+    for r in (state.get("regions") if isinstance(state.get("regions"), list) else []):
+        rk = r.get("region")
+        if rk and rk not in keymap:
+            name = _region_name(rules, rk)
+            if name != rk:
+                keymap[rk] = name
+    # longest key first: a short key that is a PREFIX of a longer one must not clobber it
+    # ("wh2_main_hef_farm_1" replaced before "wh2_main_hef_farm_1_something" gets a chance).
+    for key in sorted(keymap, key=len, reverse=True):
+        if key in text:
+            text = text.replace(key, keymap[key])
+    return text
+
+
+def _cmd_key(c):
+    if c.get("kind") == "building":
+        return ("building", c.get("region"), c.get("slot_idx"), c.get("building"))
+    if c.get("kind") == "skill":
+        return ("skill", c.get("cqi"), c.get("skill"))
+    return None
+
+
+def _already_sent(cid, turn, cmds):
+    """Which of `cmds` already sit in COMMANDS for this exact campaign+turn — a defence
+    against the model reissuing an identical order it already sent (owner-reported, real
+    Gemini replay: seven copies of the same building landed in one turn). Matches on the
+    literal strings skill_cmds_as_exec bakes into each command's generated Lua, since that
+    rewrite is what actually reaches COMMANDS and it loses the structured region/slot/
+    building/cqi/skill fields — there is nothing more structured left to compare."""
+    if cid is None or turn is None or not cmds:
+        return set()
+    try:
+        text = open(COMMANDS).read()
+    except OSError:
+        return set()
+    stamp = (f"campaign = {lua_quote(cid)}", f"turn = {int(turn)}")
+    dup = set()
+    for line in text.splitlines():
+        raw = _ENTRY_RE.match(line.strip())
+        if not raw:
+            continue
+        raw = raw.group(1)
+        if stamp[0] not in raw or stamp[1] not in raw:
+            continue
+        for c in cmds:
+            key = _cmd_key(c)
+            if key is None or key in dup:
+                continue
+            # The whole generated "code" string is itself lua_quote()d, so every embedded
+            # string literal's quotes come out ESCAPED (\") in the written file — a bare
+            # '"value"' search never matches. Bare numbers (slot_idx, cqi) are never quoted
+            # in the generated code, so those stay unescaped.
+            if key[0] == "building":
+                _, region, slot_idx, building = key
+                if (f'\\"{region}\\"' in raw and f"({slot_idx})" in raw
+                        and f'\\"{building}\\"' in raw):
+                    dup.add(key)
+            elif key[0] == "skill":
+                _, cqi, skill = key
+                if f"get_character_by_cqi({cqi})" in raw and f'\\"{skill}\\"' in raw:
+                    dup.add(key)
+    return dup
+
+
+def _building_already_sent(cid, turn, u):
+    return bool(_already_sent(cid, turn, [{"kind": "building", "region": u["region"],
+                                            "slot_idx": u["slot_idx"],
+                                            "building": u["building"]}]))
+
+
+# A POSITIVE list of first-person/present-tense claims about THIS turn specifically — never
+# a negative "unless it says already/last turn" exclusion. MEASURED (bounce review, real
+# Gemini replay): a negative-exclusion version deleted TRUE past-tense statements like "The
+# order I issued last turn is still building" (no "already" in it, so the old exclusion
+# missed it) and "The barracks was queued earlier and is still under construction" — neither
+# claims anything happened THIS turn, so neither belongs on this list, and a bare "issued"/
+# "queued"/"sent" anywhere in a sentence is not enough to flag it. Only an EXPLICIT this-turn
+# or first-person-present claim matches: "sent/issued/queued this turn", "order (was/has
+# been) sent/issued/queued", "I have sent/issued/queued", or a leading "Issued:"/"Sent:"
+# label (the shape _issued_summary itself uses).
+_COMPLETION_CLAIM_RE = re.compile(
+    r"\b(?:sent|issued|queued)\s+this\s+turn\b"
+    r"|\border\s+(?:was\s+|has\s+been\s+)?(?:sent|issued|queued)\b"
+    r"|\bi\s+have\s+(?:sent|issued|queued)\b"
+    r"|^\s*(?:issued|sent)\s*:",
+    re.I)
+
+
+def _strip_false_completion_claims(reply, cmds, prompt=None):
+    """Contradiction fix (real Gemini replay, "rerun it"): the model wrote "order was sent
+    this turn" while nothing was issued. Nothing was actually sent THIS turn -> any sentence
+    matching _COMPLETION_CLAIM_RE is false and must not reach the player as if it were true.
+    Only fires when cmds is empty; a genuine issue always has its own real summary appended
+    separately, so its own true claim is never touched.
+
+    If stripping would leave a true remainder, that remainder is returned.
+
+    If EVERY sentence is a false this-turn claim (2026-09-16 bounce item 3: the earlier
+    version returned the reply UNCHANGED here, passing the contradiction straight through —
+    "Order was sent this turn." reached the player verbatim), and a `prompt` was given to
+    re-ask against, the model is asked ONCE MORE via _chat_call with a SYSTEM NOTE saying
+    plainly that nothing was sent, and its answer is used (stripped the same way, in case it
+    still slips in a claim). If that retry is unavailable (`prompt` is None — the bare
+    unit-level call this function also supports), the caller keeps the model's ORIGINAL text
+    unchanged (the historical fallback). NEVER RETURNS EMPTY when a retry ran and produced
+    real text (2026-09-16, non-blocking item 4a: an all-false retry used to come back as "",
+    which is worse than a false claim — the player got no reply at all): the retry's text
+    minus its own claim sentences is used, and if THAT strips to nothing too (the retry is
+    all-false as well), the retry's raw text is returned unstripped rather than an empty
+    string."""
+    if cmds or not reply:
+        return reply
+    sentences = re.split(r"(?<=[.!?])\s+", reply.strip())
+    kept = [s for s in sentences if not _COMPLETION_CLAIM_RE.search(s)]
+    if kept:
+        return " ".join(kept).strip()
+    if prompt is None:
+        return reply
+    retry_prompt = (prompt + "\n\nSYSTEM NOTE: no order was sent this turn; answer without "
+                    "claiming one was.")
+    reply2, _decision2, err2 = _chat_call(retry_prompt)
+    if err2 or not reply2:
+        return reply
+    sentences2 = re.split(r"(?<=[.!?])\s+", reply2.strip())
+    kept2 = [s for s in sentences2 if not _COMPLETION_CLAIM_RE.search(s)]
+    # REVERT CHECK (executed): restoring the old `return ""` here whenever kept2 is empty
+    # (the retry itself came back all-false) makes the "re-ask comes back all-false too"
+    # test below fail — it must return reply2 unstripped, never "".
+    return " ".join(kept2).strip() if kept2 else reply2
 
 
 def record_turn(cid, history, message, reply):
@@ -3769,8 +4400,44 @@ def record_turn(cid, history, message, reply):
     return render_transcript(history)
 
 
+def _cap_reply(text, cap=REPLY_CAP):
+    """Truncate at a sentence or word boundary with '...' rather than mid-word with nothing —
+    a blunt `[:cap]` slice used to cut a name or a number in half with no sign anything was
+    lost. Looks back up to 40 chars from the cut for a boundary; a text with none that close
+    (one very long word) falls back to the blunt cut rather than eating a third of the reply."""
+    if not text or len(text) <= cap:
+        return text
+    cut = text[:cap]
+    for pat in (r"[.!?]\s", r"\s"):
+        m = None
+        for m in re.finditer(pat, cut[-40:]):
+            pass
+        if m:
+            boundary = len(cut) - 40 + m.start()
+            if boundary > cap * 0.5:  # don't chop off most of the reply hunting a boundary
+                return cut[:boundary].rstrip() + "..."
+    return cut.rstrip() + "..."
+
+
+def _chat_call(prompt):
+    """Ask the model once; return (reply_text, decision_dict, error_text). error_text is set
+    (decision None) only on a transport/shape failure the model itself never got a chance to
+    speak to — those two lines stay Python's, because there is no reply to shape."""
+    print("--- chat prompt ---\n" + prompt + "\n-------------------")
+    try:
+        decision = request_decision(CHAT_SYSTEM, prompt)
+    except SetupError as e:
+        return None, None, str(e)  # already the one plain-words sentence; don't re-wrap it
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+        return None, None, f"couldn't get a reply ({e})."
+    if not isinstance(decision, dict):
+        return None, None, f"got a {type(decision).__name__} instead of an answer. Ask again?"
+    reply = _cap_reply(str(decision.get("reply", ""))) or "(no reply text)"
+    return reply, decision, None
+
+
 def chat(rules, message):
-    global _PENDING_PURPOSE
+    global _PENDING_PURPOSE, _PENDING_OPTIONS
     print(f"chat: {message!r}")
     # B5: state FIRST. History is keyed by campaign and the campaign id only exists in the
     # state dump, so loading history before the dump could only ever load the wrong thing.
@@ -3783,8 +4450,11 @@ def chat(rules, message):
         print("  (no campaign id in the state dump — pre-B5 pack; memory is OFF this turn)")
     history = load_history(cid)
     if state is None:
+        # No prompt can be built without a live state dump, so there is no model to ask —
+        # this one line stays Python's, unlike the guardrail refusals below.
         return record_turn(cid, history, message,
-                           "Alfred: couldn't reach the campaign — is the game running?")
+                           "couldn't reach the campaign — is the game running?")
+    turn = state.get("turn")
     prefs, _mct_note = apply_dumped_settings(cid, state, load_prefs(cid))
     prefs, pref_note = apply_pref_phrases(cid, message, prefs)
     if _mct_note:
@@ -3795,106 +4465,423 @@ def chat(rules, message):
     if intent == "skills":
         purpose, problem = None, None
     if intent != "skills" and purpose is None and problem is None:
-        purpose = pending_purpose(cid, state.get("turn"), message)
+        purpose = pending_purpose(cid, turn, message)
     elif intent != "skills":
         # A named new request replaces a pending one; it cannot accidentally confirm it.
         _PENDING_PURPOSE = None
-    if problem:
-        return record_turn(cid, history, message, "Alfred: " + problem)
-    if purpose is not None:
-        may_act = allow_commands(message, (prefs.get("sliders") or {}).get("authority"))
-        # Purpose words in a factual question are not an authorisation and do not leave a
-        # pending action behind.  A non-question request may be confirmed once this turn.
-        is_question = bool(re.search(r"\?|^\s*(what|is|are|how|why)\b", message or "", re.I))
-        if not may_act and not _explicit_purpose_followup(message):
-            if not is_question:
-                remember_purpose(cid, state.get("turn"), purpose)
-                return record_turn(cid, history, message,
-                                   f"Alfred: I can consider only {_request_label(purpose)} buildings. Say 'go ahead' this turn to issue one order.")
-            purpose = None
-        if purpose is not None:
-            if labels is None:
-                return record_turn(cid, history, message,
-                                   "Alfred: reviewed Vanilla purpose labels are unavailable, so I issued no building order.")
-            prompt, ups = build_chat_prompt(rules, state, message, history,
-                                            load_journal(cid), prefs, "buildings", purpose)
-            if not ups:
-                return record_turn(cid, history, message,
-                                   f"Alfred: no legal reviewed {_request_label(purpose)} building is available, so I issued no order.")
-            print("--- chat prompt ---\n" + prompt + "\n-------------------")
-            try:
-                decision = request_decision(CHAT_SYSTEM, prompt)
-            except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
-                return record_turn(cid, history, message,
-                                   f"Alfred: couldn't get a reply ({e}).")
-            if not isinstance(decision, dict):
-                return record_turn(cid, history, message,
-                                   f"Alfred: got a {type(decision).__name__} instead of an answer. Ask again?")
-            legal = {(u["region"], u["slot_idx"], u["building"]) for u in ups}
-            proposed = decision.get("buildings") if isinstance(decision.get("buildings"), list) else []
-            def outside_subset(items):
-                return any(not isinstance(b, dict) or
-                           (b.get("region"), b.get("slot_idx"), b.get("building")) not in legal
-                           for b in items)
-            wrong = outside_subset(proposed)
-            if wrong:
-                # Reject the whole first response before any command-file write; retry sees
-                # the exact same immutable subset already printed above.
-                retry_prompt = prompt + "\n\nRETRY: Copy one exact printed (region, slot, building) tuple; do not derive a region key. Return one such building, or no buildings."
-                try:
-                    decision = request_decision(CHAT_SYSTEM, retry_prompt)
-                except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
-                    return record_turn(cid, history, message,
-                                       f"Alfred: couldn't get the restricted retry ({e}).")
-                if not isinstance(decision, dict):
-                    return record_turn(cid, history, message,
-                                       "Alfred: the restricted retry was not a valid answer; no order issued.")
-                retry_proposed = (decision.get("buildings")
-                                  if isinstance(decision.get("buildings"), list) else [])
-                if outside_subset(retry_proposed):
-                    return record_turn(cid, history, message,
-                                       "Alfred: the restricted retry still had no matching legal building; no order issued.")
-            reply = str(decision.get("reply", ""))[:REPLY_CAP] or "(no reply text)"
-            cmds = validate(decision, rules, state, ups, prefs, True, building_only=True)
-            if not cmds:
-                reply = "No order issued: no matching legal building survived the purpose, capability, and reserve checks."
-            if pref_note:
-                reply = (reply + " " + pref_note)[:REPLY_CAP]
-            if cmds:
-                write_commands(skill_cmds_as_exec(cmds), cid, state.get("turn"))
-            journal_record(cid, state, cmds)
-            summary = _issued_summary(cmds)
-            return record_turn(cid, history, message, reply + " " + summary)
-    # A generic building command cannot ask the model to choose its own purpose.  Skills
-    # remain the existing standalone path, including their own intent and validation rules.
-    if intent != "skills" and allow_commands(message, (prefs.get("sliders") or {}).get("authority")):
-        return record_turn(cid, history, message,
-                           "Alfred: name one building purpose: income, growth, public order, a recruitment role, or walls/garrison.")
-    prompt, ups = build_chat_prompt(rules, state, message, history,
-                                    load_journal(cid), prefs, intent)
-    print("--- chat prompt ---\n" + prompt + "\n-------------------")
-    try:
-        decision = request_decision(CHAT_SYSTEM, prompt)
-    except (ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
-        return record_turn(cid, history, message,
-                           f"Alfred: couldn't get a reply ({e}).")
-    # A LIST OR A BARE STRING PARSES AS VALID JSON. The try above catches a parse failure
-    # and turns it into a message he can see; it does not catch valid JSON of the wrong
-    # shape, and `.get` on a list throws right here — outside the try, so it would take the
-    # whole chat turn and he would get nothing back at all. validate() coerces the same way
-    # for the same reason; this is the reply half of it.
-    if not isinstance(decision, dict):
-        return record_turn(cid, history, message,
-                           f"Alfred: got a {type(decision).__name__} instead of an answer. "
-                           f"Ask again?")
-    reply = str(decision.get("reply", ""))[:REPLY_CAP] or "(no reply text)"
-    # B7 act gate, in Python: a question gets an answer, not spending.
-    cmds = validate(decision, rules, state, ups, prefs,
-                    allow_commands(message, (prefs.get("sliders") or {}).get("authority")))
+    may_act = allow_commands(message)
+    journal = load_journal(cid)
+    is_q = _is_question(message)
+
+    # `note` is a SYSTEM NOTE line appended to the prompt — never player-facing text on its
+    # own. The model reads it and explains in its own words (CHAT_SYSTEM says so); Python
+    # never hands the player a sentence it wrote itself for a gate result (2026-09-16 ruling:
+    # "loosen it" — purpose/legality/reserve/capability gates stay exactly as strong, only the
+    # conversation flow and reply source change).
+    note = None
+    building_only = False
+    act_now = may_act
+    ups = ()
+
+    # PICK FROM A LIST ALFRED JUST OFFERED — checked before anything else, since a bare "2"
+    # or "the second one" carries no purpose word and no narrowable name of its own; it only
+    # means anything against the exact list _offer_note remembered THIS campaign+turn.
+    offered = pending_options(cid, turn)
+    pick_idx = _parse_pick(message, offered) if offered else None
+    pick_number = _extract_pick_number(message) if offered else None
+
+    # CANCEL/UNDO — checked before EVERYTHING else, including any offer note, so it always
+    # wins (real-Gemini pass 3, finding #1: "cancel that" fell through to a silent re-list
+    # because the old check only fired when something was sent THIS exact turn; a cancel
+    # request about an earlier turn's order got no acknowledgement at all). The wrapper can
+    # never cancel a sent order regardless of which turn it went out on, so this is
+    # unconditional on `_CANCEL_RE` alone.
+    if _CANCEL_RE.search(message or ""):
+        building_only = True
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs,
+                                        "buildings")
+        lc = last_candidate(cid, turn)
+        if lc and _building_already_sent(cid, turn, lc):
+            note = (f"he seems to be asking to cancel or undo {_dropped_building_label(rules, lc)} "
+                    f"(slot {lc['slot_idx']}), sent this turn — this system "
+                    "cannot cancel or undo a sent order from here; tell him plainly, and "
+                    "that he can cancel it himself from that settlement's build queue "
+                    "in-game")
+        else:
+            note = ("he seems to be asking to cancel or undo an order — this system cannot "
+                    "cancel or undo anything already sent to the game, whichever turn it "
+                    "went out on; tell him plainly, and that he can cancel it himself from "
+                    "the relevant settlement's build queue in-game")
+        act_now = False
+    # BARE STATE-METRIC QUERIES ("treasury", "upkeep percent", "corruption level") —
+    # real-Gemini pass 3, finding #4: these fell through to a building re-list (intent="both"
+    # for words outside chat_prompt_intent's small status set) instead of stating the real
+    # number. Gated on `not may_act` (an order mentioning a metric word never lands here) AND
+    # `purpose is None and problem is None`: "income"/"growth"/"money"/"public order"/
+    # "control" are ALSO purpose words (requested_purpose(), above) with their own pending-
+    # ask/confirm machinery — MEASURED (test_offline_runner_stays_runtime_only broke) that
+    # intercepting them here instead, ahead of the purpose branch below, silently ate that
+    # flow (a bare "growth" never reached remember_purpose(), so the confirming "go ahead"
+    # had nothing pending to confirm). Left running through the existing, tested purpose path
+    # for those overlapping words; only the metric words with no purpose-label meaning at all
+    # (treasury/gold/money/upkeep/corruption; "public order"/"control"/"growth" only when
+    # requested_purpose found nothing for the exact phrase) reach the fact-note below.
+    elif not may_act and purpose is None and problem is None and _metric_query(message):
+        metric = _metric_query(message)
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs,
+                                        "question")
+        fact = _state_metric_fact(state, metric)
+        label = metric.replace("_", " ")
+        if fact:
+            note = f"he's asking about {label} — {fact}; answer directly, do not offer or list buildings"
+        else:
+            note = (f"he's asking about {label}, which is per-region — answer using the "
+                    "per-region numbers already shown above, do not offer or list buildings")
+        act_now = False
+    elif offered and pick_number is not None and pick_idx is None:
+        # A clear pick ATTEMPT ("2") whose number is out of range for what was actually
+        # offered — say so plainly and re-list, rather than silently falling through to an
+        # unrelated path (bounce review, item 6b).
+        building_only = True
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs,
+                                        "buildings")
+        note = _offer_note(cid, turn, rules, offered,
+                            f"He asked for option {pick_number}, but only {len(offered)} "
+                            "were offered; tell him plainly there is no option that high")
+        act_now = False
+    elif pick_idx is not None and is_q:
+        # A question that happens to name a pick ("which is better, 1 or 2?") never acts —
+        # a question is never an order, on every path (2026-09-16 ruling). The offered list
+        # is kept (not cleared) so a follow-up "2" without a question mark can still pick it.
+        building_only = True
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs,
+                                        "buildings")
+        note = (f"he asked a question naming option {pick_idx + 1} from the list you "
+                "offered; answer it in your own words, and issue no building command unless "
+                "he then picks one without a question")
+        act_now = False
+    elif pick_idx is not None:
+        picked = offered[pick_idx]
+        _PENDING_OPTIONS = None  # consumed either way — a picked list is not re-offered
+        building_only = True
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs,
+                                        "buildings")
+        current = _find_option(ups, picked)
+        if current is None:
+            note = (f"he picked option {pick_idx + 1} from the list you offered — "
+                    f"{_dropped_building_label(rules, picked)} — but it is no longer a "
+                    "legal option this turn; say so plainly and offer to look again. "
+                    "Issue no building command")
+        elif _building_already_sent(cid, turn, current):
+            note = _already_sent_phrasing(
+                f"he picked option {pick_idx + 1} — "
+                f"{_dropped_building_label(rules, current)} (slot {current['slot_idx']}) — "
+                "but that already matches a command sent this turn", message)
+            act_now = False  # nothing new may be issued on a duplicate (bounce item 3)
+        else:
+            note = (f"he picked option {pick_idx + 1} from the list you offered — "
+                    f"region={current['region']}, slot={current['slot_idx']}, "
+                    f"building={current['building']}. Issue exactly that command")
+            act_now = True
+            ups = [current]
+            remember_last_candidate(cid, turn, current)
+    elif problem:
+        # An ambiguous or unsupported purpose word (e.g. two purposes named at once, or an
+        # unrecognised recruitment role) — let the model ask him to be specific.
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs, intent)
+        note = (f"his request named an unclear building purpose ({problem}); present the "
+                "legal purposes (income, growth, public order, recruitment, settlement "
+                "defence) as a short numbered list and ask him to name one. Issue no "
+                "building command")
+        act_now = False
+    elif purpose is not None:
+        building_only = True
+        label = _request_label(purpose)
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs,
+                                        "buildings", purpose)
+        if not ups:
+            reason = ("reviewed Vanilla purpose labels are unavailable" if labels is None
+                       else f"no legal reviewed {label} building exists this turn")
+            note = reason + ". Say so in your own words; issue no building command"
+            act_now = False
+        else:
+            # EXACTLY ONE LEGAL OPTION SURVIVING THE PURPOSE FILTER EXECUTES AT ONCE — no
+            # "go ahead" needed, whether or not the message read as an explicit order
+            # (2026-09-16 ruling #1: supersedes the old mandatory purpose-then-confirm flow
+            # outright). A message that ALSO names a settlement or building narrows further
+            # (#1's second clause), which only matters when several options still fit.
+            # A QUESTION never triggers this — "which public order building is best here?"
+            # must get an answer, not a command, even with one legal option and even if
+            # allow_commands() somehow said yes (H1 bounce finding: it must not depend on
+            # allow_commands at all, the message's own shape is the guard).
+            narrowed = _narrow_by_target(message, rules, ups)
+            candidates = narrowed if len(narrowed) < len(ups) else ups
+            # Bounce fix (box 16, 2026-09-17): affordability applies to what's OFFERED or
+            # AUTO-ISSUED, checked before either — `candidates` (legality) stays what
+            # `len(candidates) == len(ups)` below compares against.
+            afford = affordable(candidates, state, prefs)
+            if not afford:
+                floor = effective_floor(state, prefs)
+                note = (f"no legal {label} option is affordable right now — treasury "
+                        f"{state.get('treasury', 0)}, reserve {floor}. Tell him to save up; "
+                        "do not list, offer, or issue any building")
+                act_now = False
+            elif len(afford) == 1 and not is_q:
+                u = afford[0]
+                remember_last_candidate(cid, turn, u)
+                if _building_already_sent(cid, turn, u):
+                    note = _already_sent_phrasing(
+                        f"the only legal {label} option — "
+                        f"{_dropped_building_label(rules, u)} (slot {u['slot_idx']}) — "
+                        "already matches a command sent this turn", message)
+                    act_now = False  # nothing new may be issued on a duplicate (bounce item 3)
+                else:
+                    note = (f"exactly one legal {label} option matches his request — "
+                            f"region={u['region']}, slot={u['slot_idx']}, "
+                            f"building={u['building']}. Issue that command")
+                    act_now = True
+                    ups = [u]  # H2: restrict validate()/retry to the option that decided this
+            elif not act_now:
+                # Several options fit (or it was a question) and this wasn't an order. But
+                # if narrowing found NOTHING NEW (candidates is still the full purpose
+                # subset) and the last thing chat() decided on this turn is already sent, a
+                # vague follow-up ("rerun it", "no its not queue") almost certainly means
+                # that, not a fresh request — say so instead of re-listing the same options
+                # (bounce item 6a).
+                lc = last_candidate(cid, turn)
+                if (lc and len(candidates) == len(ups)
+                        and _building_already_sent(cid, turn, lc)):
+                    note = _already_sent_phrasing(
+                        "the last building you considered this turn — "
+                        f"{_dropped_building_label(rules, lc)} (slot {lc['slot_idx']}) — "
+                        "already matches a command sent this turn", message)
+                else:
+                    remember_purpose(cid, turn, purpose)
+                    note = _offer_note(cid, turn, rules, afford,
+                                       f"Several legal {label} options fit and he did not "
+                                       "name one, or asked which is best." if len(afford) > 1
+                                       else f"Only one legal {label} option exists, but this "
+                                       "reads as a question, not an order.")
+    else:
+        prompt, ups = build_chat_prompt(rules, state, message, history, journal, prefs, intent)
+        narrowed = ()
+        if intent in ("buildings", "both") and ups:
+            # No purpose word at all — a request can still narrow to one legal building by
+            # naming a settlement or the building itself (2026-09-16 #1), with no purpose
+            # word and no "go ahead" required. Never for a question (H1).
+            narrowed = _narrow_by_target(message, rules, ups)
+        if len(narrowed) == 1 and act_now and not is_q:
+            u = narrowed[0]
+            remember_last_candidate(cid, turn, u)
+            if _building_already_sent(cid, turn, u):
+                note = _already_sent_phrasing(
+                    "the option matching his request — "
+                    f"{_dropped_building_label(rules, u)} (slot {u['slot_idx']}) — already "
+                    "matches a command sent this turn", message)
+                act_now = False  # nothing new may be issued on a duplicate (bounce item 3)
+            else:
+                note = (f"exactly one legal option matches his request — "
+                        f"region={u['region']}, slot={u['slot_idx']}, building={u['building']}. "
+                        "Issue that command")
+                ups = [u]  # H2: restrict validate()/retry to the option that decided this
+        elif intent != "skills":
+            # An act marker alone (e.g. a bare "go ahead" with no pending purpose and no
+            # named target), OR a question that happened to contain one (e.g. "what should
+            # i build?"), is not a standing licence to spend on whatever the model dreams
+            # up — the same invariant the old purpose gate enforced, just without a canned
+            # refusal: the model still answers (now with a numbered offer when there is a
+            # concrete list to offer), validate() still drops every command, and nothing
+            # was silently loosened for the undirected case.
+            act_now = False
+            # DEDUPE COLLAPSE FIX (2026-09-16, real Gemini replay): a vague follow-up that
+            # narrows to nothing new, right after the last thing chat() decided on this turn
+            # was already sent, means THAT — but ONLY when the message itself is ABOUT that
+            # order: repeating it (an act marker/confirmation, via `may_act`) or pushing back
+            # on it (_PUSHBACK_RE — "that didn't work", "no it's not queued"). Before this
+            # fix, `len(narrowed) == len(ups)` alone triggered the override — which is ALWAYS
+            # true when only one legal building exists (narrowing is a no-op on a one-item
+            # list), so every follow-up after a single-option order — a genuinely unrelated
+            # question ("whats my upkeep?"), "cancel that" — collapsed to "already sent this
+            # turn" instead of being answered.
+            # REVERT CHECK (executed): restoring the old unconditional
+            # `if (lc and len(narrowed) == len(ups) and ...)` (dropping the `not is_q and
+            # (may_act or pushback)` guard) makes the "whats my upkeep?" test below fail —
+            # the SYSTEM NOTE becomes the bare "already sent" override instead of a normal
+            # answer path with the fact carried as context.
+            # (a cancel-shaped message never reaches this branch at all any more — the
+            # top-of-chat() CANCEL check above takes it first, on every turn, whether or
+            # not anything was sent THIS specific turn; real-Gemini pass 3 finding #1.)
+            lc = last_candidate(cid, turn)
+            lc_sent = bool(lc and intent in ("buildings", "both") and ups
+                           and _building_already_sent(cid, turn, lc))
+            # SAME-TARGET ONLY (real-Gemini pass 3, finding #2): the override must fire only
+            # when the message is about the SAME thing that was sent — "ok build the other
+            # one... the expensive one" was told "that was already sent", which is true of
+            # the cheap one that WAS sent but false by implication about the expensive one he
+            # actually asked for. `_narrow_by_target` finds no name match for vocabulary like
+            # this (nothing in `ups` is literally named "other"/"expensive"), so it falls back
+            # to the FULL set and `len(narrowed) == len(ups)` alone couldn't tell "nothing
+            # named" apart from "he named something else that just isn't a literal building
+            # name". _DIFFERENT_TARGET_RE catches the comparison/alternative words that mean
+            # the latter, and routes to the normal offer/context path instead.
+            # REVERT CHECK (executed): removing `and not _DIFFERENT_TARGET_RE.search(...)`
+            # makes the "the expensive one" test below fail — the reply becomes the bare
+            # already-sent line instead of the offer/context path.
+            if (lc_sent and not is_q and len(narrowed) == len(ups)
+                  and (may_act or _PUSHBACK_RE.search(message or ""))
+                  and not _DIFFERENT_TARGET_RE.search(message or "")):
+                note = _already_sent_phrasing(
+                    "the last building you considered this turn — "
+                    f"{_dropped_building_label(rules, lc)} (slot {lc['slot_idx']}) — already "
+                    "matches a command sent this turn", message)
+            elif intent in ("buildings", "both") and ups:
+                # Bounce fix (box 16, 2026-09-17): same affordability gate as the purpose
+                # branch above — never number/offer an option he cannot afford.
+                afford = affordable(ups, state, prefs)
+                if not afford:
+                    floor = effective_floor(state, prefs)
+                    note = (f"no legal building option is affordable right now — treasury "
+                            f"{state.get('treasury', 0)}, reserve {floor}. Tell him to save "
+                            "up; do not list, offer, or issue any building")
+                else:
+                    intro = ("No purpose or single target was named and several legal building "
+                             "options exist, or he asked which is best.")
+                    if lc_sent:
+                        intro = (f"{_dropped_building_label(rules, lc)} (slot {lc['slot_idx']}) "
+                                 "was already sent this turn (mention that in passing, in the "
+                                 "build queue after the panel refreshes) — but answer what he "
+                                 "actually asked, don't just repeat that it was sent. " + intro)
+                    note = _offer_note(cid, turn, rules, afford, intro)
+
+    # COST/COMPARISON QUESTIONS (box 13, real-Gemini pass 2, findings #5/#7): "whats the
+    # cheapest option overall" went unanswered even with costs printed right in the option
+    # list, and "whats the most expensive one" got two INVENTED buildings and a fake region
+    # name back instead. Whenever a note already lists real options (built by _offer_note,
+    # which always shows each one's cost) and the message is asking about cost, tell the
+    # model plainly to answer FROM that exact list and invent nothing else.
+    if note and is_q and COST_QUESTION_RE.search(message or ""):
+        note += ("; he is asking about cost or which option is cheapest/most expensive — "
+                 "answer directly using ONLY the costs already listed above, and name "
+                 "nothing that is not in that list, instead of just re-listing them and "
+                 "asking him to pick")
+
+    # BACK-REFERENCES WITHIN A TURN (box 13, real-Gemini pass 2, finding #6): "the cheap
+    # one", "how much was that again", "same for the other province" all went unresolved
+    # because whatever WAS offered earlier this turn was nowhere in the prompt for a message
+    # that didn't itself trigger a fresh offer. Whenever an offer is still standing for this
+    # exact campaign+turn and this turn's note isn't ALREADY a fresh numbered re-offer of it
+    # (spotted by the "1) " line _offer_note always starts with), carry it forward as labelled
+    # context so the model can resolve a reference to it even off the pick shortcut.
+    _standing_offer = pending_options(cid, turn)
+    if _standing_offer and not (note and re.search(r"(?:^|\n)1\) ", note)):
+        backref = ("options offered earlier this turn: " + "; ".join(
+            f"{i + 1}) {_describe_option(rules, u)}" for i, u in enumerate(_standing_offer)))
+        note = (note + "; " + backref) if note else backref
+
+    if note:
+        prompt += "\n\nSYSTEM NOTE: " + note.rstrip(".") + "."
+
+    reply, decision, err = _chat_call(prompt)
+    if err:
+        return record_turn(cid, history, message, err)
+
+    # CALL BUDGET (box 13 follow-up, item 5, coordinator-measured "4-call stacking path"): up
+    # to four DIFFERENT re-asks could each fire off the same turn — cost/superlative
+    # hallucination, the mismatch retry, the FALSE_CLAIM dropped-reason re-ask, and
+    # _strip_false_completion_claims's own internal re-ask. Capped here at 3 model calls total
+    # per turn (the first call, plus at most 2 more) — the mismatch retry stays its own
+    # reserved slot in practice (it is the only one that ever fires before validate()), and
+    # every other re-ask below checks `calls < 3` before spending the shared second slot.
+    # REVERT CHECK (executed): dropping the `calls < 3` guards (and passing `prompt=prompt`
+    # unconditionally to _strip_false_completion_claims) lets the item-5 stacking test below
+    # make 4 calls again instead of 3.
+    calls = 1
+
+    # COST-QUESTION QUALITY GUARD (box 13, pass 2 finding #5 + pass 3 finding #3/#9): the note
+    # above tells the model to answer only from the real list and to name the true max/min,
+    # but a system prompt is a request the model can still miss — this is the enforcement.
+    # Combined into ONE possible re-ask (never two) covering both an invented building/price
+    # AND a superlative question whose reply omits the actual cheapest/priciest option.
+    # REVERT CHECK (executed): skipping this block (never re-asking) makes the hallucinated-
+    # building test below fail — the invented "Archive"/"Shrine of Asuryan" text survives.
+    if (calls < 3 and is_q and COST_QUESTION_RE.search(message or "") and _standing_offer
+            and (_reply_has_unlisted_building(reply, rules, _standing_offer)
+                 or _reply_misses_superlative(reply, rules, _standing_offer, message))):
+        retry_prompt = (prompt + "\n\nSYSTEM NOTE: your last answer either named a building, "
+                         "region, or price that is not in the list above, or missed the "
+                         "actual cheapest/most expensive option among them. Only those "
+                         "options exist this turn — answer again using ONLY them, name the "
+                         "real cheapest/most expensive one if he asked for it, and invent "
+                         "nothing else.")
+        reply2, decision2, err2 = _chat_call(retry_prompt)
+        calls += 1
+        if not err2 and reply2:
+            reply, decision = reply2, decision2
+
+    if calls < 3 and act_now and ups:
+        # ONE RETRY, kept exactly as before: give the model one chance to correct a tuple
+        # that doesn't match an enumerated option before falling through to validate(), which
+        # is the real backstop either way — an illegal tuple never survives it regardless.
+        legal = {(u["region"], u["slot_idx"], u["building"]) for u in ups}
+        proposed = [b for b in (decision.get("buildings") or []) if isinstance(b, dict)]
+        if proposed and any((b.get("region"), b.get("slot_idx"), b.get("building")) not in legal
+                             for b in proposed):
+            retry_prompt = (prompt + "\n\nRETRY: Copy one exact printed (region, slot, "
+                            "building) tuple; do not derive a region key. Return one such "
+                            "building, or no buildings.")
+            reply2, decision2, err2 = _chat_call(retry_prompt)
+            calls += 1
+            if not err2:
+                reply, decision = reply2, decision2
+
+    dropped = []
+    cmds = validate(decision, rules, state, ups, prefs, act_now, building_only=building_only,
+                     dropped=dropped)
+    if cmds:
+        # DEDUPE against what THIS campaign+turn already sent (real Gemini replay, owner-
+        # reported: seven copies of the same building landed in one turn). Applies uniformly
+        # after validate() so it catches every path, not just the ones above that could
+        # check a single known candidate in advance.
+        dup_keys = _already_sent(cid, turn, cmds)
+        if dup_keys:
+            for c in cmds:
+                if _cmd_key(c) in dup_keys:
+                    print(f"  DROP {c['kind']} (already sent this turn): "
+                          f"{c.get('skill') or c.get('building')}")
+            cmds = [c for c in cmds if _cmd_key(c) not in dup_keys]
+    # FALSE_CLAIM FIX (real Gemini replay): validate() dropping a command (reserve floor,
+    # a switched-off capability, an illegal building/skill) is silent from the model's own
+    # side — it already wrote "ordered"/"sending" before validate() ever ran. Re-ask ONCE
+    # with the real reason(s) so the reply the player sees says what actually happened,
+    # instead of leaving the earlier (now false) claim to survive un-contradicted.
+    # REVERT CHECK (executed): skipping this block (keeping `reply` from the first _chat_call
+    # untouched whenever `dropped`) makes the reserve-floor/capability-off/illegal-skill
+    # FALSE_CLAIM tests below fail — the reply keeps its "ordered"/"sending" wording instead
+    # of naming the drop reason.
+    if calls < 3 and dropped:
+        reasons = "; ".join(f"{d['label']} — {d['reason']}" for d in dropped)
+        sent_note = (" " + _issued_summary(cmds, rules)) if cmds else ""
+        retry_prompt = (prompt + "\n\nSYSTEM NOTE: the following was NOT sent this turn — "
+                         + reasons + "." + sent_note + " Tell him plainly what was not done "
+                         "and the REAL reason above, in your own words, without claiming it "
+                         "was ordered, without proposing a substitute he did not ask for, and "
+                         "without inventing a different (in-game) reason — use the real one "
+                         "given here even if it names a setting rather than a game rule.")
+        reply2, _decision2, err2 = _chat_call(retry_prompt)
+        calls += 1
+        if not err2 and reply2:
+            reply = reply2
+    reply = _delint_keys(rules, state, reply)
+    # CONTRADICTION FIX (real Gemini replay, "rerun it"): nothing was actually sent this
+    # turn, so any sentence CLAIMING one was — the model's own text, not ours — must not
+    # reach the player as if it were true. `prompt=None` once the call budget is spent
+    # disables its own internal re-ask (see the CALL BUDGET note above) — it still strips
+    # what it can locally either way.
+    reply = _strip_false_completion_claims(reply, cmds, prompt if calls < 3 else None)
     if pref_note:
-        reply = (reply + " " + pref_note)[:REPLY_CAP]  # never store a preference silently
+        reply = _cap_reply(reply + " " + pref_note)  # never store a preference silently
     if cmds:  # don't clobber a sweep's not-yet-executed commands with an empty chat write
-        write_commands(skill_cmds_as_exec(cmds), cid, state.get("turn"))
+        write_commands(skill_cmds_as_exec(cmds), cid, turn)
     # THE CHAT PATH NEVER JOURNALLED. It has always READ the journal (load_journal above) but
     # never written one, so every build ordered through the chat window was missing from the
     # campaign's own record — and since the economics summary attributes value using that
@@ -3906,14 +4893,11 @@ def chat(rules, message):
     journal_record(cid, state, cmds)
     for c in cmds:
         print(f"  CMD {c['kind']}: {c.get('skill') or c.get('building')} — {c['why']}")
-    # Don't repeat what Alfred already said. MEASURED in his campaign 2026-09-01 01:12:
-    # the reply ended "No orders issued." and the appended summary said it again, so the
-    # window showed "No orders issued. No orders issued." The summary exists to state what
-    # was ACTUALLY executed — which is worth appending when there are commands, and noise
-    # when the model has already said there are none.
-    summary = _issued_summary(cmds)
-    full = reply if (not cmds and summary.lower().rstrip(".") in reply.lower()) \
-        else reply + " " + summary
+    # Don't repeat what Alfred already said, and don't add a Python-authored "No orders
+    # issued." on top of his own text — he already says so, in his own words, whenever
+    # nothing was sent. The summary earns its place only when something REAL happened.
+    summary = _issued_summary(cmds, rules) if cmds else ""
+    full = (reply + " " + summary) if summary else reply
     print(f"chat done: {len(cmds)} commands written")
     return record_turn(cid, history, message, full)
 
@@ -3994,8 +4978,7 @@ def _start_webui(stop_fn):
         return
     _WEBUI_STARTED = True
     try:
-        webui.start(data_dir(ROOT), apply_setup_request, stop_fn,
-                    lambda: check_setup())
+        webui.start(data_dir(ROOT), save_setup, stop_fn, ready_status)
     except Exception as e:
         print(f"webui failed to start: {e}")
 
@@ -4027,8 +5010,9 @@ def _run_companion(sleep=time.sleep, wait_seconds=30, stop_fn=None):
 
 def main():
     if "--check-model" in sys.argv:
-        request_decision("Return only a JSON object.",
-                         'Return {"reply":"ok","skills":[],"buildings":[]}.')
+        ok, msg = probe_model()
+        if not ok:
+            sys.exit(msg)
         print("model check passed")
         return
     if "--companion" in sys.argv:
@@ -4120,7 +5104,7 @@ def _run_loop(rules):
                             # (dropped) or, worse, a shared key.
                             _cid = campaign_id(read_state())
                             reply = record_turn(_cid, load_history(_cid), message,
-                                                f"Alfred: chat failed ({e}).")
+                                                f"chat failed ({e}).")
                         inplace_write(CHAT_REPLY, token + "\n" + reply + "\n")
         except KeyboardInterrupt:
             print("bye")

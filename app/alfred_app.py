@@ -8,10 +8,8 @@ Contract with Box 1 (daemon/paths.py): SetupError, check_setup(home=None, platfo
 environ=None) -> (ok, message), and daemon/aigen.py's _run_companion() (A4: waits and
 re-checks every 30s on SetupError, never exits).
 """
-import json
 import os
 import plistlib
-import re
 import subprocess
 import sys
 import time
@@ -155,7 +153,7 @@ def plain_open(runner=subprocess.run, home=None, opener=webbrowser.open, sleep=t
     setup/status page) and open that page in the default browser."""
     executable = sys.executable
     if not app_ok(executable):
-        opener("about:blank")  # nothing to show; player needs to move the app first
+        opener((resource_root() / "app" / "move_to_applications.html").as_uri())
         return
     _unlink_webui_info()  # a stale port+token from a previous run must never win the race below
     install(executable, runner=runner, home=home)

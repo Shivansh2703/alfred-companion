@@ -103,7 +103,7 @@ class PidFileAndSingleInstance(unittest.TestCase):
                 popen=lambda *a, **k: self._FakePopen(9999))
             self.assertEqual(Path(launcher.pid_path(environ)).read_text().strip(), "9999")
 
-    def test_second_run_does_not_start_second_companion_while_alive(self):
+    def test_second_run_does_not_start_second_companion_while_page_is_live(self):
         with tempfile.TemporaryDirectory() as appdata, tempfile.TemporaryDirectory() as pkg:
             environ = {"APPDATA": appdata}
             launcher.start_companion(
@@ -111,13 +111,33 @@ class PidFileAndSingleInstance(unittest.TestCase):
                 popen=lambda *a, **k: self._FakePopen(1234))
 
             starts = []
-            with mock.patch.object(launcher, "wait_for_webui", return_value=None):
+            with mock.patch.object(launcher, "wait_for_webui",
+                                   return_value={"port": 4321, "token": "abc"}):
                 launcher.run(
                     environ=environ,
                     popen=lambda *a, **k: starts.append(1) or self._FakePopen(1),
                     sleep=lambda s: None, opener=lambda url: None,
                     alive_check=lambda pid, runner=None: pid == 1234)
             self.assertEqual(starts, [])
+
+    def test_alive_process_with_stale_server_record_is_restarted(self):
+        with tempfile.TemporaryDirectory() as appdata:
+            environ = {"APPDATA": appdata}
+            pid = Path(launcher.pid_path(environ))
+            pid.parent.mkdir(parents=True)
+            pid.write_text("1234")
+            starts = []
+            with mock.patch.object(launcher, "wait_for_webui", side_effect=[
+                    None, {"port": 4321, "token": "fresh"}]), \
+                 mock.patch.object(launcher, "stop_companion", return_value=True) as stop:
+                rc = launcher.run(
+                    environ=environ,
+                    popen=lambda *a, **k: starts.append(1) or self._FakePopen(2),
+                    sleep=lambda s: None, opener=lambda url: None,
+                    alive_check=lambda pid, runner=None: True)
+            self.assertEqual(rc, 0)
+            stop.assert_called_once_with(environ=environ)
+            self.assertEqual(starts, [1])
 
     def test_stop_removes_pid_file(self):
         with tempfile.TemporaryDirectory() as appdata, tempfile.TemporaryDirectory() as pkg:
@@ -222,7 +242,8 @@ class WebUiPolling(unittest.TestCase):
             data_dir.mkdir(parents=True, exist_ok=True)
             (data_dir / "webui.json").write_text(json.dumps({"port": 4321, "token": "abc123"}))
 
-            webui = launcher.wait_for_webui(environ=environ, timeout=1, sleep=lambda s: None)
+            webui = launcher.wait_for_webui(
+                environ=environ, timeout=1, sleep=lambda s: None, probe=lambda data: True)
             self.assertEqual(webui, {"port": 4321, "token": "abc123"})
 
             opened = []

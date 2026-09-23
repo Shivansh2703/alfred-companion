@@ -17,6 +17,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 STARTUP_REL = os.path.join(
     "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
@@ -167,7 +169,19 @@ def stop_companion(environ=None, runner=subprocess.run):
     return True
 
 
-def wait_for_webui(environ=None, timeout=60, sleep=time.sleep, clock=time.monotonic):
+def _webui_live(data, timeout=1):
+    if not isinstance(data, dict) or "port" not in data or "token" not in data:
+        return False
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{data['port']}/health", timeout=timeout) as response:
+            return response.read() == b"alfred\n"
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
+def wait_for_webui(environ=None, timeout=60, sleep=time.sleep, clock=time.monotonic,
+                   probe=_webui_live):
     """Poll <data_dir>/webui.json (Box 6's contract) for up to `timeout` seconds.
     Returns {"port": int, "token": str} or None if it never appeared."""
     path = webui_path(environ)
@@ -178,7 +192,7 @@ def wait_for_webui(environ=None, timeout=60, sleep=time.sleep, clock=time.monoto
                 data = json.load(f)
         except (OSError, ValueError):
             data = None
-        if isinstance(data, dict) and "port" in data and "token" in data:
+        if probe(data):
             return data
         if clock() >= deadline:
             return None
@@ -212,8 +226,13 @@ def run(environ=None, popen=subprocess.Popen, sleep=time.sleep, opener=None,
     """Returns a process exit code: 0 on success, 2 if the companion's page never came up
     (Alfred.vbs shows a MsgBox on a non-zero exit)."""
     ensure_startup_entry(environ=environ)
-    if not companion_running(environ=environ, alive_check=alive_check):
-        start_companion(environ=environ, popen=popen)
+    webui = wait_for_webui(environ=environ, timeout=0, sleep=sleep)
+    if webui:
+        open_url(webui, opener=opener)
+        return 0
+    if companion_running(environ=environ, alive_check=alive_check):
+        stop_companion(environ=environ)
+    start_companion(environ=environ, popen=popen)
     webui = wait_for_webui(environ=environ, sleep=sleep)
     if webui is None:
         _log_timeout(environ=environ)

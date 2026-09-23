@@ -68,7 +68,7 @@ bind_exchange(EXCHANGE)
 
 
 def _config_path():
-    return os.path.join(ROOT, MODEL_CONFIG)
+    return os.path.join(data_dir(ROOT), MODEL_CONFIG)
 
 
 def _credentials_path():
@@ -94,6 +94,9 @@ def _valid_base_url(value):
 def load_model_config():
     """Load the local-only provider choice. No file means the historical Claude path."""
     path = _config_path()
+    legacy = os.path.join(ROOT, MODEL_CONFIG)  # pre-0.1.1 location; read until the next save
+    if not os.path.exists(path) and os.path.exists(legacy):
+        path = legacy
     if not os.path.exists(path):
         return {"provider": "claude", "model": "claude", "timeout_seconds": 240}
     try:
@@ -229,7 +232,7 @@ def _write_setup_config(config, api_key=None):
 
 
 def forget_setup():
-    for path in (_config_path(), _credentials_path()):
+    for path in (_config_path(), os.path.join(ROOT, MODEL_CONFIG), _credentials_path()):
         try: os.remove(path)
         except FileNotFoundError: pass
 
@@ -265,14 +268,14 @@ def apply_setup_request(payload):
     if provider == "ollama":
         if key is not None: raise ValueError("Ollama does not accept an API key")
         config = {"provider": provider, "model": model, "base_url": base_url, "timeout_seconds": 240}
-        try: os.remove(_credentials_path())
-        except FileNotFoundError: pass
     else:
+        if key is None:
+            key = _stored_api_key()
         if not isinstance(key, str) or not key or len(key) > 1000:
             raise ValueError("setup API key is invalid")
         config = {"provider": provider, "model": model, "base_url": base_url, "api_key_source": "stored", "timeout_seconds": 240}
         if effort is not None: config["reasoning_effort"] = effort
-        _write_setup_config(config, key)
+        _write_setup_config(config, payload.get("api_key"))
         return
     _write_setup_config(config)
 
@@ -394,6 +397,30 @@ def probe_model():
     return True, "model check passed"
 
 
+def test_model():
+    """Run and cache the same harmless probe used by readiness checks and the dashboard."""
+    global _PROBE
+    try:
+        config = load_model_config()
+    except ValueError as e:
+        return False, str(e)
+    if config["provider"] == "claude":
+        return False, "Set your model and API key, then Save."
+    ok, message = probe_model()
+    _PROBE = ((config["provider"], config["model"]), ok, message)
+    return ok, message
+
+
+def forget_api_key():
+    """Forget only the saved secret; provider choice and campaign data stay intact."""
+    global _PROBE
+    try:
+        os.remove(_credentials_path())
+    except FileNotFoundError:
+        pass
+    _PROBE = None
+
+
 def save_setup(payload):
     """Write setup, then always run the test prompt (forget clears the cache and does not call)."""
     global _PROBE
@@ -401,9 +428,7 @@ def save_setup(payload):
     if payload == {"action": "forget"}:
         _PROBE = None
         return
-    ok, msg = probe_model()
-    config = load_model_config()
-    _PROBE = ((config["provider"], config["model"]), ok, msg)
+    test_model()
 
 
 def ready_status():
@@ -4037,6 +4062,10 @@ def journal_record(cid, state, cmds=()):
     # handed, this field is the visible record of that decision, not its source of truth.
     rows.append({
         "turn": turn,
+        "recorded_at": int(time.time()),
+        "campaign_name": state.get("campaign_name"),
+        "faction": state.get("faction"),
+        "faction_name": _faction_name(state, state.get("faction")),
         "treasury": state.get("treasury"),
         "income": state.get("income"),
         "net_income": state.get("net_income"),
@@ -4186,6 +4215,94 @@ def render_transcript(history):
             rows.extend("    " + w for w in wrapped[1:])
         rows.append("")
     return "\n".join(rows).rstrip("\n")
+
+
+def _read_object(path):
+    try:
+        with open(path) as f:
+            value = json.load(f)
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def dashboard_snapshot(selected_campaign=None):
+    """Return the safe, read-only state rendered by the local companion dashboard."""
+    try:
+        config = load_model_config()
+        provider, model, config_error = config["provider"], config["model"], None
+    except ValueError as e:
+        provider, model, config_error = None, None, str(e)
+    probe = None
+    if provider and _PROBE and _PROBE[0] == (provider, model):
+        probe = {"ok": bool(_PROBE[1]), "message": _redact_probe_text(_PROBE[2])}
+
+    history_blob = _read_object(CHAT_HISTORY)
+    journal_blob = _read_object(JOURNAL)
+    prefs_blob = _read_object(PREFS)
+    state = read_state()
+    current_id = campaign_id(state)
+    ids = set(history_blob) | set(journal_blob) | set(prefs_blob)
+    if current_id:
+        ids.add(current_id)
+
+    campaigns = []
+    for cid in ids:
+        if not isinstance(cid, str) or not cid:
+            continue
+        rows = journal_blob.get(cid) if isinstance(journal_blob.get(cid), list) else []
+        latest = rows[-1] if rows and isinstance(rows[-1], dict) else {}
+        current = cid == current_id
+        source = state if current and isinstance(state, dict) else latest
+        faction = source.get("faction")
+        faction_name = (_faction_name(state, faction) if current else source.get("faction_name")) \
+            or faction
+        if not faction_name or faction_name == faction:
+            faction_name = f"Campaign …{cid[-6:]}"
+        prefs = load_prefs(cid)
+        history = history_blob.get(cid)
+        if not isinstance(history, list):
+            history = []
+        history = [row for row in history[-CHAT_KEEP:] if isinstance(row, dict)]
+        if current:
+            diplomacy = source.get("diplomacy") if isinstance(source.get("diplomacy"), dict) else {}
+            wars = [_faction_name(state, key) for key in diplomacy.get("at_war_with", [])]
+            regions = len(source.get("regions")) if isinstance(source.get("regions"), list) else None
+            armies = len(source.get("armies")) if isinstance(source.get("armies"), list) else None
+            last_seen = int(os.path.getmtime(STATE)) if STATE and os.path.exists(STATE) else None
+        else:
+            wars = latest.get("at_war_with") if isinstance(latest.get("at_war_with"), list) else []
+            regions, armies = latest.get("regions"), latest.get("armies")
+            last_seen = latest.get("recorded_at")
+        caps = prefs.get("capabilities") or {}
+        context = [
+            f"Turn {source.get('turn', '?')} with {regions if regions is not None else '?'} regions and "
+            f"{armies if armies is not None else '?'} armies.",
+            f"Treasury {source.get('treasury', '?')}; net income {source.get('net_income', '?')}; "
+            f"reserve floor {prefs.get('reserve_floor', RESERVE_FLOOR_MIN)}.",
+            f"Preference: {prefs.get('stance', 'balanced')}. Buildings "
+            f"{'enabled' if caps.get('buildings') else 'disabled'}; skills "
+            f"{'enabled' if caps.get('skills') else 'disabled'}.",
+            f"Alfred remembers {len(history)} recent chat {'exchange' if len(history) == 1 else 'exchanges'} "
+            f"and {len(rows)} campaign journal {'entry' if len(rows) == 1 else 'entries'}.",
+        ]
+        campaigns.append({
+            "id": cid, "label": faction_name, "current": current,
+            "campaign_name": source.get("campaign_name"), "faction": faction,
+            "turn": source.get("turn"), "last_seen": last_seen,
+            "treasury": source.get("treasury"), "income": source.get("income"),
+            "net_income": source.get("net_income"), "regions": regions, "armies": armies,
+            "wars": wars, "prefs": prefs, "history": history, "context": context,
+        })
+    campaigns.sort(key=lambda row: (not row["current"], -(row.get("turn") or -1), row["id"]))
+    selected = next((row for row in campaigns if row["id"] == selected_campaign), None)
+    if selected is None and campaigns:
+        selected = campaigns[0]
+    return {
+        "provider": provider, "model": model, "config_error": config_error,
+        "key_saved": _stored_api_key() is not None, "probe": probe,
+        "campaigns": campaigns, "selected": selected,
+    }
 
 
 def parse_chat_request(text):
@@ -4978,7 +5095,8 @@ def _start_webui(stop_fn):
         return
     _WEBUI_STARTED = True
     try:
-        webui.start(data_dir(ROOT), save_setup, stop_fn, ready_status)
+        webui.start(data_dir(ROOT), save_setup, stop_fn, ready_status,
+                    dashboard_snapshot, test_model, forget_api_key)
     except Exception as e:
         print(f"webui failed to start: {e}")
 

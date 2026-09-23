@@ -3,6 +3,7 @@
 temp data dir; the API key must never be echoed into a response body or a log."""
 import http.client
 import io
+import json
 import os
 import sys
 import tempfile
@@ -35,9 +36,35 @@ class WebUITestCase(unittest.TestCase):
         self.data_dir = self.tmp.name
         self.apply_setup = FakeSetup()
         self.stop_calls = []
+        self.test_calls = []
+        self.forget_calls = []
+        campaign = {
+            "id": "campaign-1", "label": "Yvresse", "current": True, "turn": 8,
+            "last_seen": 1_700_000_000, "treasury": 3533, "income": 4432,
+            "net_income": -1665, "regions": 6, "armies": 10, "wars": ["Broken Axe"],
+            "context": ["Turn 8 with 6 regions.", "Buildings enabled; skills enabled."],
+            "history": [{"you": "What now? <script>alert(1)</script>",
+                         "alfred": "Hold cash."}],
+        }
+        self.dashboard_data = {
+            "provider": "gemini", "model": "gemini-3.5-flash-lite",
+            "key_saved": True, "probe": {"ok": True, "message": "model check passed"},
+            "campaigns": [campaign], "selected": campaign,
+        }
+
+        def dashboard(selected=None):
+            data = dict(self.dashboard_data)
+            if selected:
+                data["selected"] = next(
+                    (row for row in data["campaigns"] if row["id"] == selected),
+                    data.get("selected"))
+            return data
+
         self.server, self.thread, self.port, self.token = webui.start(
             self.data_dir, self.apply_setup, lambda: self.stop_calls.append(True),
-            lambda: (True, "Alfred is ready. Start Warhammer III."))
+            lambda: (True, "Alfred is ready. Start Warhammer III."), dashboard,
+            lambda: (self.test_calls.append(True) or (True, "model check passed")),
+            lambda: self.forget_calls.append(True))
 
     def tearDown(self):
         self.server.shutdown()
@@ -78,6 +105,26 @@ class Get(WebUITestCase):
         self.assertIn('name="api_key"', body)
         self.assertIn("Gemini", body)
         self.assertIn("Ollama (this computer)", body)
+        self.assertNotIn("SECRET-XYZ", body)
+
+    def test_dashboard_explains_key_reuse_and_shows_safe_campaign_context(self):
+        conn = self._conn()
+        conn.request("GET", "/?campaign=campaign-1")
+        body = conn.getresponse().read().decode()
+        self.assertIn("Leave this blank to keep the saved key", body)
+        self.assertIn("Saved securely", body)
+        self.assertIn("Campaigns Alfred knows", body)
+        self.assertIn("Yvresse", body)
+        self.assertIn("What Alfred knows", body)
+        self.assertIn("Recent chat", body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn('<option value="gemini" selected>', body)
+
+    def test_live_info_accepts_only_the_running_alfred_server(self):
+        self.assertEqual(webui.live_info(self.data_dir)["port"], self.port)
+        webui._write_info(self.data_dir, 1, "stale")
+        self.assertIsNone(webui.live_info(self.data_dir, timeout=0.1))
 
 
 class Security(WebUITestCase):
@@ -119,6 +166,14 @@ class Setup(WebUITestCase):
         self.assertEqual(self.apply_setup.calls,
                          [{"provider": "ollama", "model": "qwen3.5:4b"}])
 
+    def test_blank_gemini_key_is_not_added_to_the_request(self):
+        status, body = self._post(
+            "/setup", f"token={self.token}&provider=gemini&api_key=")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.apply_setup.calls,
+                         [{"provider": "gemini", "model": "gemini-3.5-flash-lite"}])
+        self.assertNotIn('value="SECRET', body)
+
     def test_invalid_key_shows_error_and_writes_nothing(self):
         long_key = "A" * 2000
         status, body = self._post(
@@ -126,6 +181,16 @@ class Setup(WebUITestCase):
         self.assertEqual(status, 200)
         self.assertIn("setup API key is invalid", body)
         self.assertNotIn(long_key, body)
+
+    def test_connection_test_and_forget_key_are_explicit_actions(self):
+        status, body = self._post("/test-model", f"token={self.token}&campaign=campaign-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.test_calls, [True])
+        self.assertIn("model check passed", body)
+        status, body = self._post("/forget-key", f"token={self.token}&campaign=campaign-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.forget_calls, [True])
+        self.assertIn("Saved Gemini key forgotten", body)
 
 
 class SetupWithRealAigen(unittest.TestCase):
@@ -154,6 +219,31 @@ class SetupWithRealAigen(unittest.TestCase):
                     server.server_close()
             cred = data_dir / "alfred-credentials.json"
             self.assertFalse(cred.exists())
+
+    def test_blank_gemini_key_reuses_saved_key_without_revealing_it(self):
+        with tempfile.TemporaryDirectory() as home:
+            data_dir = Path(home) / "data"
+            marker = "SAVED-SECRET-XYZ"
+            with mock.patch.dict(os.environ, {"ALFRED_DATA_DIR": str(data_dir)}):
+                aigen.apply_setup_request({"provider": "gemini",
+                                           "model": "gemini-3.5-flash-lite",
+                                           "api_key": marker})
+                server, thread, port, token = webui.start(
+                    str(data_dir), aigen.apply_setup_request, lambda: None,
+                    lambda: (True, "ok"))
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    body = f"token={token}&provider=gemini&api_key=".encode()
+                    conn.request("POST", "/setup", body=body,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+                    resp = conn.getresponse()
+                    text = resp.read().decode()
+                    self.assertEqual(resp.status, 200)
+                    self.assertNotIn(marker, text)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                self.assertEqual(aigen._stored_api_key(), marker)
 
 
 class Stop(WebUITestCase):
@@ -246,6 +336,64 @@ class Logging(WebUITestCase):
 class UrlFor(unittest.TestCase):
     def test_token_never_rides_the_url(self):
         self.assertNotIn("tok-abc", webui.url_for(54321, "tok-abc"))
+
+
+class DashboardSnapshot(unittest.TestCase):
+    def test_snapshot_combines_current_and_historical_campaigns_without_secrets(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = {name: str(Path(d) / filename) for name, filename in {
+                "STATE": "state.json", "CHAT_HISTORY": "chat.json",
+                "JOURNAL": "journal.json", "PREFS": "prefs.json"}.items()}
+            Path(paths["STATE"]).write_text(json.dumps({
+                "campaign_id": "current", "faction": "faction_key",
+                "faction_names": {"faction_key": "Yvresse", "enemy": "Broken Axe"},
+                "turn": 8, "treasury": 3533, "income": 4432, "net_income": -1665,
+                "regions": [{}, {}], "armies": [{}],
+                "diplomacy": {"at_war_with": ["enemy"]},
+            }))
+            Path(paths["CHAT_HISTORY"]).write_text(json.dumps({
+                "current": [{"you": "hello", "alfred": "ready"}],
+                "old": [{"you": "old", "alfred": "memory"}],
+            }))
+            Path(paths["JOURNAL"]).write_text(json.dumps({
+                "old": [{"turn": 3, "faction_name": "Eataine", "recorded_at": 123,
+                         "treasury": 1000, "net_income": 200, "regions": 2,
+                         "armies": 1, "at_war_with": []}],
+            }))
+            Path(paths["PREFS"]).write_text(json.dumps({
+                "current": {"stance": "hold", "reserve_floor": 4000,
+                            "capabilities": {"buildings": True, "skills": False}},
+            }))
+            with mock.patch.multiple(aigen, **paths), \
+                 mock.patch.object(aigen, "load_model_config", return_value={
+                     "provider": "gemini", "model": "gemini-3.5-flash-lite"}), \
+                 mock.patch.object(aigen, "_stored_api_key", return_value="NEVER-RETURN-ME"), \
+                 mock.patch.object(aigen, "_PROBE", (("gemini", "gemini-3.5-flash-lite"),
+                                                      True, "model check passed")):
+                snapshot = aigen.dashboard_snapshot("old")
+            self.assertTrue(snapshot["key_saved"])
+            self.assertNotIn("NEVER-RETURN-ME", repr(snapshot))
+            self.assertEqual([c["id"] for c in snapshot["campaigns"]], ["current", "old"])
+            self.assertEqual(snapshot["campaigns"][0]["label"], "Yvresse")
+            self.assertEqual(snapshot["campaigns"][0]["wars"], ["Broken Axe"])
+            self.assertEqual(snapshot["selected"]["label"], "Eataine")
+            self.assertIn("reserve floor 4000", " ".join(snapshot["campaigns"][0]["context"]))
+
+    def test_corrupt_campaign_files_degrade_to_an_empty_dashboard(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = {name: str(Path(d) / filename) for name, filename in {
+                "STATE": "state.json", "CHAT_HISTORY": "chat.json",
+                "JOURNAL": "journal.json", "PREFS": "prefs.json"}.items()}
+            for path in paths.values():
+                Path(path).write_text("not json")
+            with mock.patch.multiple(aigen, **paths), \
+                 mock.patch.object(aigen, "load_model_config", return_value={
+                     "provider": "ollama", "model": "qwen3.5:4b"}), \
+                 mock.patch.object(aigen, "_stored_api_key", return_value=None), \
+                 mock.patch.object(aigen, "_PROBE", None):
+                snapshot = aigen.dashboard_snapshot()
+            self.assertEqual(snapshot["campaigns"], [])
+            self.assertIsNone(snapshot["selected"])
 
 
 class AtomicWrites(unittest.TestCase):

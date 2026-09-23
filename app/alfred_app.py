@@ -140,7 +140,7 @@ def _wait_for_webui(data_dir_path, tries=40, sleep=time.sleep):
     bundled starting.html instead of leaving nothing open."""
     webui = _load_webui()
     for _ in range(tries):
-        info = webui.read_info(data_dir_path)
+        info = webui.live_info(data_dir_path)
         if info:
             return info
         sleep(0.3)
@@ -155,10 +155,13 @@ def plain_open(runner=subprocess.run, home=None, opener=webbrowser.open, sleep=t
     if not app_ok(executable):
         opener((resource_root() / "app" / "move_to_applications.html").as_uri())
         return
-    _unlink_webui_info()  # a stale port+token from a previous run must never win the race below
-    install(executable, runner=runner, home=home)
     webui = _load_webui()
-    info = _wait_for_webui(str(data_dir()), sleep=sleep)
+    data_dir_path = str(data_dir())
+    info = webui.live_info(data_dir_path)
+    if not info:
+        _unlink_webui_info()
+        install(executable, runner=runner, home=home)
+        info = _wait_for_webui(data_dir_path, sleep=sleep)
     if info:
         opener(webui.url_for(info["port"]))
     else:

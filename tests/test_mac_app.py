@@ -204,22 +204,35 @@ class PlainOpenWebUI(unittest.TestCase):
                     sys.path.insert(0, daemon_dir)
                 import webui
 
-                # install() stands in for the real companion coming up and writing its
-                # own fresh webui.json — writing it BEFORE plain_open would now make it
-                # look stale and plain_open unlinks stale info before installing.
                 def fake_install(executable, runner=None, home=None):
-                    webui._write_info(str(data_dir), 54321, "tok-abc")
                     return None, None
 
                 runner = FakeRunner()
                 opened = []
                 with mock.patch.object(alfred_app, "install", fake_install), \
+                     mock.patch.object(webui, "live_info", side_effect=[
+                         None, {"port": 54321, "token": "tok-abc"}]), \
                      mock.patch.object(sys, "executable",
                                        "/Applications/Alfred.app/Contents/MacOS/Alfred"):
                     alfred_app.plain_open(runner=runner, home=home, opener=opened.append,
                                            sleep=lambda s: None)
             self.assertEqual(len(opened), 1)
             self.assertIn("54321", opened[0])  # port only; the token never rides the URL
+
+    def test_plain_open_reuses_reachable_companion_without_reinstalling(self):
+        with tempfile.TemporaryDirectory() as home:
+            data_dir = Path(home) / "data"
+            with mock.patch.dict(os.environ, {"ALFRED_DATA_DIR": str(data_dir)}):
+                import webui
+                opened = []
+                with mock.patch.object(webui, "live_info", return_value={
+                         "port": 54321, "token": "tok-abc"}), \
+                     mock.patch.object(alfred_app, "install") as install, \
+                     mock.patch.object(sys, "executable",
+                                       "/Applications/Alfred.app/Contents/MacOS/Alfred"):
+                    alfred_app.plain_open(home=home, opener=opened.append)
+            install.assert_not_called()
+            self.assertEqual(opened, ["http://127.0.0.1:54321/"])
 
     def test_plain_open_never_calls_osascript(self):
         with tempfile.TemporaryDirectory() as home:
@@ -271,6 +284,7 @@ class PlainOpenWebUI(unittest.TestCase):
                 runner = FakeRunner()
                 opened = []
                 with mock.patch.object(alfred_app, "install", fake_install), \
+                     mock.patch.object(webui, "live_info", return_value=None), \
                      mock.patch.object(sys, "executable",
                                        "/Applications/Alfred.app/Contents/MacOS/Alfred"):
                     alfred_app.plain_open(runner=runner, home=home, opener=opened.append,
@@ -279,6 +293,7 @@ class PlainOpenWebUI(unittest.TestCase):
             self.assertNotIn("11111", opened[0])
             self.assertIn("starting.html", opened[0])
             self.assertNotIn("11111", opened[0])
+            self.assertFalse(Path(webui.info_path(str(data_dir))).exists())
 
     def test_stop_unlinks_webui_info(self):
         with tempfile.TemporaryDirectory() as home:

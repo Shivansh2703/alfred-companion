@@ -29,12 +29,19 @@ else.
 5. In the game, enable **Alfred** and **Mod Configuration Tool** in the mod list, use the
    Vanilla preset, and turn off any overhaul packs. Play.
 
-## Getting a free Gemini key
+## Get a model key
 
-1. Go to Google AI Studio in your browser and sign in with a Google account.
+Alfred needs a model to think with. The easiest one is Google's Gemini, which has a free tier.
+
+1. Go to Google AI Studio (aistudio.google.com) and sign in with a Google account.
 2. Click "Get API key," create one, and copy it.
-3. Alfred opens a page in your browser; paste your key there (the Set up model page) and
-   click **Save**.
+3. Paste it into the Alfred setup page in your browser and click **Save**.
+
+**What it costs.** Alfred uses `gemini-3.5-flash-lite`. On Google's pricing page it is listed as
+free of charge on the free tier, with lower rate limits. If you move to a paid plan, Google lists
+$0.30 per million input tokens and $2.50 per million output tokens (ai.google.dev/gemini-api/docs/pricing,
+checked 2026-10-13). I have not measured the cost of a typical session, so check your provider's
+pricing before you play long campaigns on a paid key. Running a local Ollama model costs nothing.
 
 The key is saved only on this computer. It is never written into the mod, your savegame, any
 log file, or the chat transcript.

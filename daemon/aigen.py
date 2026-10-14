@@ -4221,6 +4221,25 @@ def render_transcript(history):
     return "\n".join(rows).rstrip("\n")
 
 
+def chat_stamp(cid):
+    """Which campaign a chat reply was rendered for, as ONE whitespace-only row: "\\t\\t" then
+    16 tab/space bits of (h*31+byte) mod 65536 over the id. Whitespace-only so a mod that
+    predates the stamp draws one blank row and nothing else. Must match
+    src/lua/aigen_chat_stamp.lua (tests pin one shared vector). 1 in 65536 collision: the
+    old behaviour, not a new failure."""
+    h = 0
+    for b in cid.encode():
+        h = (h * 31 + b) % 65536
+    return "\t\t" + "".join("\t" if (h >> i) & 1 else " " for i in range(15, -1, -1))
+
+
+def stamp_reply(transcript, cid):
+    """Prefix the rendered transcript with the campaign stamp; no id -> today's format."""
+    if not cid:
+        return transcript
+    return chat_stamp(cid) + ("\n" + transcript if transcript else "")
+
+
 def _read_object(path):
     try:
         with open(path) as f:
@@ -5227,6 +5246,10 @@ def _run_loop(rules):
                             _cid = campaign_id(read_state())
                             reply = record_turn(_cid, load_history(_cid), message,
                                                 f"chat failed ({e}).")
+                        # chat() just forced a fresh dump, so the state on disk is this
+                        # turn's campaign; the stamp lets the mod refuse it at the next boot
+                        # of a DIFFERENT campaign (alfred-20261014-stale-chat-mod-fix).
+                        reply = stamp_reply(reply, campaign_id(read_state()))
                         inplace_write(CHAT_REPLY, token + "\n" + reply + "\n")
         except KeyboardInterrupt:
             print("bye")

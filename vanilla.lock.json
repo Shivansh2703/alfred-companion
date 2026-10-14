@@ -3,12 +3,12 @@
   "preset": "vanilla",
   "profile": "vanilla",
   "rules_path": "data/rules.json",
-  "rules_sha256": "687377511a34a2e0c01098f8766093211a90589c0947ea56564f32600ba144e3",
-  "game_build_id": "24237342",
+  "rules_sha256": "0ee961e5035574e49cc3ef7aaa37df654f50e2b043db212e67ba1978a4eae550",
+  "game_build_id": "25509431",
   "labels": {
     "path": "data/purpose_labels_vanilla.json",
-    "sha256": "9b9ffadf978e9a35cc9bebd3b1f6ecec3fd38ff7919604623c4c54f46f5207d4",
-    "rulebook_sha256": "687377511a34a2e0c01098f8766093211a90589c0947ea56564f32600ba144e3",
+    "sha256": "0819a748df5e903571a31752327b27261087ce189742f126f5e00e212e9fd606",
+    "rulebook_sha256": "0ee961e5035574e49cc3ef7aaa37df654f50e2b043db212e67ba1978a4eae550",
     "review_status": "reviewed_offline_independent_approved"
   }
 }

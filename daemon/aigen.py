@@ -1220,6 +1220,10 @@ def resource_gated_chains(rules):
             m = re.search(r"_secondary(?:_(.+))?$", t)
             if m:
                 sfx.add(m.group(1) or "")
+        # build 25509431 added named-settlement slots with the resource as a prefix
+        # (…_secondary_salt_al_haikk, …_wine_wurtbad) — same deposit, longer suffix; fold them
+        # into the bare resource suffix or salt/wine stop looking single-resource.
+        sfx = {s for s in sfx if not any(s != o and o and s.startswith(o + "_") for o in sfx)}
         if len(sfx) == 1 and "" not in sfx:
             out.add(chain)
     _RESOURCE_GATED = frozenset(out)

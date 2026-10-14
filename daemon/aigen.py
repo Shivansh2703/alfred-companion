@@ -20,7 +20,7 @@ EXCHANGE = discover_exchange_dir(required=False)
 RULES = os.path.join(ROOT, "data", "rules.json")
 PURPOSE_LABELS = os.path.join(ROOT, "data", "purpose_labels_vanilla.json")
 STATE = DEV_HOOK = TRIGGER = COMMANDS = CANDIDATES = None
-SWEEP_REQUEST = CHAT_REQUEST = CHAT_REPLY = SETUP_REQUEST = None
+SWEEP_REQUEST = CHAT_REQUEST = CHAT_REPLY = SETUP_REQUEST = EXECUTED = None
 # TRANSCRIPT (not just the latest reply) — the in-game panel reads its scrollback straight out
 # of this file, so no new exchange file has to exist before the game boots (Feral
 # negative-lookup cache, docs/research/feral-file-visibility.md). If the panel fails to build,
@@ -51,7 +51,7 @@ MODEL_CONFIG = "alfred.local.json"
 def bind_exchange(path):
     """Point every exchange-file global at one scripts directory."""
     global EXCHANGE, STATE, DEV_HOOK, TRIGGER, COMMANDS, CANDIDATES
-    global SWEEP_REQUEST, CHAT_REQUEST, CHAT_REPLY, SETUP_REQUEST
+    global SWEEP_REQUEST, CHAT_REQUEST, CHAT_REPLY, SETUP_REQUEST, EXECUTED
     EXCHANGE = path or ""
     STATE = os.path.join(EXCHANGE, "aigen_state.json")
     DEV_HOOK = os.path.join(EXCHANGE, "aigen_dev.lua")
@@ -62,6 +62,7 @@ def bind_exchange(path):
     CHAT_REQUEST = os.path.join(EXCHANGE, "aigen_chat_request.txt")
     CHAT_REPLY = os.path.join(EXCHANGE, "aigen_chat_reply.txt")
     SETUP_REQUEST = os.path.join(EXCHANGE, "aigen_setup_request.txt")
+    EXECUTED = os.path.join(EXCHANGE, "aigen_executed.txt")  # mod -> daemon: ids it has run
 
 
 bind_exchange(EXCHANGE)
@@ -1055,7 +1056,7 @@ def ensure_exchange_files():
     # An empty (comment-only) file loads to a chunk that does nothing.
     defaults = {TRIGGER: "init", COMMANDS: "return {}", CANDIDATES: "return {}",
                 SWEEP_REQUEST: "init", CHAT_REQUEST: "init", CHAT_REPLY: "init",
-                SETUP_REQUEST: "init",
+                SETUP_REQUEST: "init", EXECUTED: "",
                 DEV_HOOK: "-- dev hook: edit me and quicksave-reload to run Lua in the "
                           "live game.\n-- Empty on purpose; an empty chunk does nothing.\n"}
     for path, content in defaults.items():
@@ -1069,7 +1070,28 @@ def ensure_exchange_files():
             os.chmod(path, 0o600)
 
 
-def legal_skills(rules, char):
+def _skill_applicable(rec, faction, subculture):
+    """A skill node or set restricted to a faction / subculture applies only inside it. Unknown
+    faction or subculture (old dump) -> treated as applicable: fail open."""
+    rec = rec or {}
+    return ((not rec.get("faction") or faction is None or rec["faction"] == faction)
+            and (not rec.get("subculture") or subculture is None
+                 or rec["subculture"] == subculture))
+
+
+def _skill_set_for(sk, subtype, faction, subculture):
+    """Which node set this lord uses. Rulebooks with `subtype_sets`/`set_meta` can hold several
+    sets per subtype (one per faction / subculture); prefer a set restricted to OUR
+    faction/subculture, else an unrestricted one, else the first-wins `sets_by_subtype`."""
+    default = sk["sets_by_subtype"].get(subtype)
+    cands = (sk.get("subtype_sets") or {}).get(subtype) or ([default] if default else [])
+    meta = sk.get("set_meta") or {}
+    ok = [c for c in cands if _skill_applicable(meta.get(c), faction, subculture)]
+    specific = [c for c in ok if (meta.get(c) or {}).get("faction") or (meta.get(c) or {}).get("subculture")]
+    return (specific or ok or [default])[0]
+
+
+def legal_skills(rules, char, state=None):
     """Enumerate legal next skills for one character. Returns [(key, tier, is_levelup), ...]
     — untaken options first (tier-sorted), then already-taken skills eligible for a
     level-up (skills are multi-level; measured 08-27, Tyrion's Combined Elites went
@@ -1079,7 +1101,9 @@ def legal_skills(rules, char):
     if not isinstance(char.get("skills"), list):
         return []  # candidates not yet probed
     sk = rules["skills"]
-    set_key = sk["sets_by_subtype"].get(char["subtype"])
+    state = state or {}
+    fac, sub = state.get("faction"), state.get("subculture")
+    set_key = _skill_set_for(sk, char["subtype"], fac, sub)
     if not set_key:
         return []
     taken = set(char["skills"])
@@ -1090,6 +1114,8 @@ def legal_skills(rules, char):
             continue
         if not node.get("visible", True):
             continue
+        if not _skill_applicable(node, fac, sub):
+            continue  # restricted to another faction / subculture: never offered
         # R1: unlocked_at_rank is NOT a filter here (Synthesis §2: read-apis.md documents
         # character:rank() as 1-6, the DB gates go up to 21 — a live read is owed before
         # trusting either scale). A wrong blocking filter costs the owner every deep skill;
@@ -1110,6 +1136,10 @@ def legal_skills(rules, char):
             # data/rules_*.json degrades to the old (stricter-or-equal) behaviour instead of
             # crashing the sweep — the same class of trap as the first-run rulebook gate.
             links = [(l, "REQUIRED") if isinstance(l, str) else tuple(l) for l in links]
+            # a parent restricted to another faction/subculture can never be taken here, so it
+            # neither blocks (REQUIRED) nor counts (SUBSET_REQUIRED)
+            links = [(p, t) for p, t in links
+                     if _skill_applicable(sk["nodes"].get(p), fac, sub)]
             required = [p for p, t in links if t == "REQUIRED"]
             subset = [p for p, t in links if t == "SUBSET_REQUIRED"]
             if any(sk["nodes"].get(p, {}).get("skill") not in taken for p in required):
@@ -1269,6 +1299,22 @@ def primary_ok(level_rec, prim):
     return need is None or prim is None or prim >= need
 
 
+def _level_is_dead(levels, key):
+    """True when this building level AND every level above it in its chain record no effect,
+    no unit unlock and no opened slots — nothing recorded. Used for a prompt TAG only, never to
+    filter (a garrison chain's benefit lives outside these fields). A stepping stone (empty itself, but a
+    later level pays) is NOT dead. The VMP armoury/necromancers/ossuary chains are the
+    case that found this (audit 2026-10-14 #9): 1000-6000 gold for nothing on build 25509431.
+    Ceiling: only benefits recorded in rules.json count (not garrison tables)."""
+    seen = 0
+    while key and key in levels and seen < 30:
+        v = levels[key]
+        if v.get("fx") or v.get("unlocks") or v.get("opens_slots"):
+            return False
+        key, seen = v.get("next"), seen + 1
+    return True
+
+
 def dev_ok(level_rec, have):
     """Can the region pay this build's DEVELOPMENT POINT cost as well as its gold?
 
@@ -1320,6 +1366,7 @@ def building_upgrades(rules, state):
                             "unlock_units": levels[nxt].get("unlock_units", ""),
                             "unlock_cp": levels[nxt].get("unlock_cp", 0),
                             "opens_slots": levels[nxt].get("opens_slots", 0),
+                            "no_effect": _level_is_dead(levels, nxt),
                             # AN UPGRADE REPLACES what is there. Carrying the current
                             # building's income lets the prompt show the GAIN rather than
                             # the new building's absolute figure — see _fx_str.
@@ -1616,7 +1663,8 @@ def building_construction(rules, state):
                             "unlocks": v.get("unlocks", 0),
                             "unlock_units": v.get("unlock_units", ""),
                             "unlock_cp": v.get("unlock_cp", 0),
-                            "opens_slots": v.get("opens_slots", 0)})
+                            "opens_slots": v.get("opens_slots", 0),
+                            "no_effect": _level_is_dead(levels, k)})
     return out
 
 
@@ -1912,6 +1960,11 @@ def _fx_str(u):
         if cp:
             bit += f" ({int(cp)} combat power)"
         fx = f"{fx}, {bit}" if fx else bit
+    if not fx and u.get("no_effect"):
+        # ANNOTATION ONLY, never a filter: rules.json holds no fx/unlocks/slots for this level
+        # or any above it, but the benefit may live elsewhere (e.g. garrison troops in the
+        # armed-citizenry tables), so "none recorded" is not "none in the game".
+        fx = "(no effect found in game data)"
     return fx
 
 
@@ -2231,6 +2284,11 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
             CAPABILITIES[k][0] for k in CAPABILITIES if caps[k]) or "nothing at all"))
     # B6a: this campaign's own measured record. Kept to one line — it is context, and the
     # sweep prompt has a hard-won token budget (19.8k -> 3.5k, 2026-08-31).
+    # rows from a later turn than the one on screen belong to a save that was rolled back
+    # (audit 2026-10-14 #7); journal_record trims them on disk only AFTER the first prompt
+    if isinstance(state.get("turn"), int):
+        journal = [r for r in journal if not (isinstance(r.get("turn"), int)
+                                              and r["turn"] > state["turn"])]
     econ = econ_summary(journal)
     if econ:
         lines.append("THIS CAMPAIGN SO FAR: " + econ)
@@ -2285,7 +2343,7 @@ def build_prompt(rules, state, journal=(), prefs=None, intent="both", purpose=No
         pts = c.get("points")
         if pts in (None, "unknown", 0):
             continue
-        opts = legal_skills(rules, c) if show_skill_options else ()
+        opts = legal_skills(rules, c, state) if show_skill_options else ()
         if show_skill_options and not opts:
             continue
         n_chars += 1
@@ -2601,7 +2659,7 @@ def validate(decision, rules, state, upgrade_options, prefs=None, may_act=True,
     skill_used = {}  # cqi -> accepted skill commands so far this sweep
     for s in decision.get("skills", []):
         c = chars.get(s.get("cqi"))
-        legal = {k for k, _, _ in legal_skills(rules, c)} if c else set()
+        legal = {k for k, _, _ in legal_skills(rules, c, state)} if c else set()
         cqi = s.get("cqi")
         pts = c.get("points") if c else None
         # B1b: an unknown point count is NOT a licence to spend freely. When the mod has
@@ -2811,7 +2869,10 @@ def write_commands(cmds, cid=None, turn=None):
     new_tokens = {_id_token(c["id"]) for c in cmds if c.get("id") is not None}
     carried = [raw for (tok, raw) in _read_existing_commands()
                if tok is None or tok not in new_tokens]
-    carried = carried[-CARRY_CAP:]
+    _emit_commands(carried[-CARRY_CAP:], cmds)
+
+
+def _emit_commands(carried, cmds=()):
     lines = ["return {"]
     for raw in carried:
         lines.append("  " + raw + ",")
@@ -2824,6 +2885,44 @@ def write_commands(cmds, cid=None, turn=None):
     inplace_write(COMMANDS, "\n".join(lines))
 
 
+def process_executed_report(text):
+    """The mod lists the ids it has run (one per line, aigen_executed.txt). MARK them
+    `done = true` in aigen_commands.lua and keep the entry: the done-flag that stops a re-run
+    lives in the SAVEGAME, so reloading the same turn's save loses it, but a new mod skips
+    any entry carrying `done` (audit 2026-10-14 #1). The entry must stay in the file because
+    _already_sent reads it as this turn's record of what was sent (duplicate-order guard,
+    cancel notes); the CARRY_CAP pushes it out in time. An old mod ignores the unknown field
+    (today's behaviour). Unknown ids are a no-op; an old mod never writes the report."""
+    done = {_id_token(i) for i in (text or "").split() if i}
+    if not done:
+        return
+    entries = _read_existing_commands()
+    keep, changed = [], False
+    for tok, raw in entries:
+        if tok in done and not re.search(r"\bdone\s*=\s*true\b", raw):
+            raw = raw[:-1].rstrip() + ", done = true }"
+            changed = True
+        keep.append(raw)
+    if changed:
+        _emit_commands(keep)
+
+
+_last_executed = None  # last aigen_executed.txt body handed to process_executed_report
+
+
+def poll_executed():
+    """Read the mod's executed-ids report and mark them. Called every loop tick AND from the
+    dump wait loop, so a chat/sweep in flight does not widen the reload window."""
+    global _last_executed
+    try:
+        cur = open(EXECUTED).read() if os.path.exists(EXECUTED) else None
+    except OSError:
+        return  # torn read; retry next tick
+    if cur is not None and cur != _last_executed:
+        _last_executed = cur
+        process_executed_report(cur)
+
+
 def trigger_and_wait_for_state(rules):
     """Shared by sweep() and chat(): fire the mod's state dump and block for it.
     Returns the fresh state dict, or None if the game never answered (30s)."""
@@ -2832,6 +2931,7 @@ def trigger_and_wait_for_state(rules):
     mtime0 = os.path.getmtime(STATE) if os.path.exists(STATE) else 0
     for _ in range(90):
         time.sleep(1)
+        poll_executed()
         if os.path.exists(STATE) and os.path.getmtime(STATE) > mtime0:
             break
     else:
@@ -4164,7 +4264,7 @@ def campaign_id(state):
     return cid if isinstance(cid, str) and cid else None
 
 
-def load_history(cid):
+def load_history(cid, turn=None):
     """[{"you": str, "alfred": str}, ...], oldest first, for ONE campaign. Fails soft to
     [] — a missing or corrupt history must never stop Alfred answering — and returns []
     for an unknown campaign rather than serving another playthrough's transcript."""
@@ -4178,7 +4278,14 @@ def load_history(cid):
     if not isinstance(h, dict):
         return []  # pre-B5 flat list: not attributable to a campaign, so not inherited
     turns = h.get(cid)
-    return turns[-CHAT_KEEP:] if isinstance(turns, list) else []
+    if not isinstance(turns, list):
+        return []
+    if isinstance(turn, int):
+        # after loading an older save, exchanges from a LATER turn describe a future that no
+        # longer exists. Old entries with no "turn" field are kept: they cannot be dated.
+        turns = [t for t in turns if not (isinstance(t, dict) and isinstance(t.get("turn"), int)
+                                          and t["turn"] > turn)]
+    return turns[-CHAT_KEEP:]
 
 
 def save_history(cid, history):
@@ -4238,6 +4345,29 @@ def stamp_reply(transcript, cid):
     if not cid:
         return transcript
     return chat_stamp(cid) + ("\n" + transcript if transcript else "")
+
+
+def stamp_legacy_reply():
+    """Startup, once: a reply file left by a pre-stamp companion ("<token>\\n<transcript>\\n",
+    unstamped) is rewritten IN PLACE as that campaign's stamped transcript, same token, when
+    exactly one saved campaign's rendered history equals it. Otherwise untouched. Without
+    this the new mod draws another campaign's chat at boot (unstamped -> draw, for compat)."""
+    try:
+        with open(CHAT_REPLY) as f:
+            text = f.read()
+        if not text.endswith("\n"):
+            return
+        token, _, body = text[:-1].partition("\n")
+        if not token or not body.strip() or body.startswith("\t\t"):
+            return
+        blob = _read_object(CHAT_HISTORY)
+        hits = [cid for cid, h in blob.items()
+                if isinstance(h, list) and render_transcript([r for r in h if isinstance(r, dict)]) == body]
+        if len(hits) == 1:
+            inplace_write(CHAT_REPLY, token + "\n" + stamp_reply(body, hits[0]) + "\n")
+            print("  stamped the saved chat reply for its campaign")
+    except Exception as e:
+        print(f"  (legacy chat reply not stamped: {e})")
 
 
 def _read_object(path):
@@ -4317,6 +4447,16 @@ def dashboard_snapshot(selected_campaign=None):
             "net_income": source.get("net_income"), "regions": regions, "armies": armies,
             "wars": wars, "prefs": prefs, "history": history, "context": context,
         })
+    # Two campaigns of one faction (or a re-minted id after reloading a save from before Alfred's
+    # first save, kept separate on purpose) must be tellable apart: id tail + latest turn
+    # (audit 2026-10-14 #13/#14).
+    _seen = {}
+    for row in campaigns:
+        _seen[row["label"]] = _seen.get(row["label"], 0) + 1
+    for row in campaigns:
+        if _seen[row["label"]] > 1:
+            t = row.get("turn")
+            row["label"] = f"{row['label']} (…{row['id'][-6:]}, turn {t if t is not None else '?'})"
     campaigns.sort(key=lambda row: (not row["current"], -(row.get("turn") or -1), row["id"]))
     selected = next((row for row in campaigns if row["id"] == selected_campaign), None)
     if selected is None and campaigns:
@@ -4326,6 +4466,13 @@ def dashboard_snapshot(selected_campaign=None):
         "key_saved": _stored_api_key() is not None, "probe": probe,
         "campaigns": campaigns, "selected": selected,
     }
+
+
+def token_campaign(token):
+    """The new mod's chat token is "<campaign_id>:<time>:<n>"; the old one is "<time>:<n>"
+    (one colon). Returns the campaign id, or None for an old/unreadable token."""
+    parts = (token or "").rsplit(":", 2)
+    return parts[0] if len(parts) == 3 and parts[0] else None
 
 
 def parse_chat_request(text):
@@ -4434,14 +4581,16 @@ def _already_sent(cid, turn, cmds):
         text = open(COMMANDS).read()
     except OSError:
         return set()
-    stamp = (f"campaign = {lua_quote(cid)}", f"turn = {int(turn)}")
+    # exact turn: "turn = 1" is a prefix of "turn = 12", so a substring test dropped real orders
+    # after loading an older save
+    stamp = (f"campaign = {lua_quote(cid)}", re.compile(rf"\bturn = {int(turn)}(?!\d)"))
     dup = set()
     for line in text.splitlines():
         raw = _ENTRY_RE.match(line.strip())
         if not raw:
             continue
         raw = raw.group(1)
-        if stamp[0] not in raw or stamp[1] not in raw:
+        if stamp[0] not in raw or not stamp[1].search(raw):
             continue
         for c in cmds:
             key = _cmd_key(c)
@@ -4530,12 +4679,15 @@ def _strip_false_completion_claims(reply, cmds, prompt=None):
     return " ".join(kept2).strip() if kept2 else reply2
 
 
-def record_turn(cid, history, message, reply):
+def record_turn(cid, history, message, reply, turn=None):
     """Append this exchange, persist it, and return the WHOLE rendered transcript — which is
     what now goes into CHAT_REPLY for the panel to draw. Every return path in chat() goes
     through here, so an error reply is remembered and shown like any other. `cid` None
     (pre-B5 pack) still renders the transcript for this session; it just isn't persisted."""
-    history = list(history) + [{"you": message, "alfred": reply}]
+    entry = {"you": message, "alfred": reply}
+    if isinstance(turn, int):
+        entry["turn"] = turn
+    history = list(history) + [entry]
     save_history(cid, history)
     return render_transcript(history)
 
@@ -4576,19 +4728,34 @@ def _chat_call(prompt):
     return reply, decision, None
 
 
-def chat(rules, message):
-    global _PENDING_PURPOSE, _PENDING_OPTIONS
+_CHAT_CID = None  # the campaign the last chat() call established (None = none yet this call)
+
+
+def chat(rules, message, token=None):
+    global _PENDING_PURPOSE, _PENDING_OPTIONS, _CHAT_CID
     print(f"chat: {message!r}")
+    _CHAT_CID = None
     # B5: state FIRST. History is keyed by campaign and the campaign id only exists in the
     # state dump, so loading history before the dump could only ever load the wrong thing.
     state = trigger_and_wait_for_state(rules)
     cid = campaign_id(state)
+    _CHAT_CID = cid
     if cid is None:
         # Visible, not silent: the installed pack predates B5, so there is no campaign to
         # key memory to and Alfred answers this turn with no recall. Better said out loud
         # than discovered by the owner asking a follow-up and getting a blank stare.
         print("  (no campaign id in the state dump — pre-B5 pack; memory is OFF this turn)")
-    history = load_history(cid)
+    # Audit #2: the message was typed in the campaign named by the token. If the game now
+    # shows another one, do not act on it or remember it (answer is stamped for the loaded
+    # campaign so that campaign's window draws it). Old mod / old tokens: no prefix, unchanged.
+    history = load_history(cid, state.get("turn") if isinstance(state, dict) else None)
+    sent_from = token_campaign(token)
+    if cid is not None and sent_from is not None and sent_from != cid:
+        print("  chat refused: typed in another campaign")
+        # shown inside the loaded campaign's scrollback, NOT saved ("records nothing")
+        return render_transcript(history + [{
+            "you": message,
+            "alfred": "That message was sent from a different campaign; send it again here."}])
     if state is None:
         # No prompt can be built without a live state dump, so there is no model to ask —
         # this one line stays Python's, unlike the guardrail refusals below.
@@ -4923,7 +5090,7 @@ def chat(rules, message):
 
     reply, decision, err = _chat_call(prompt)
     if err:
-        return record_turn(cid, history, message, err)
+        return record_turn(cid, history, message, err, turn)
 
     # CALL BUDGET (box 13 follow-up, item 5, coordinator-measured "4-call stacking path"): up
     # to four DIFFERENT re-asks could each fire off the same turn — cost/superlative
@@ -5039,7 +5206,7 @@ def chat(rules, message):
     summary = _issued_summary(cmds, rules) if cmds else ""
     full = (reply + " " + summary) if summary else reply
     print(f"chat done: {len(cmds)} commands written")
-    return record_turn(cid, history, message, full)
+    return record_turn(cid, history, message, full, turn)
 
 
 def _build_mismatch_message(expected):
@@ -5099,6 +5266,7 @@ def _startup():
         raise SetupError(_build_mismatch_message(expected))
     rules = load_rules()
     ensure_exchange_files()
+    stamp_legacy_reply()
     _disarm_setup_request()
     if rules["game_build_id"] != game_build_id_live():
         raise SetupError(_build_mismatch_message(rules["game_build_id"]))
@@ -5180,6 +5348,25 @@ def _stdin_watchable(platform=None):
         return False
 
 
+def answer_chat(rules, message, token=None):
+    """One chat request -> the stamped transcript to write into CHAT_REPLY. Pure extraction
+    of what _run_loop did inline, so the crash and timeout paths can be tested."""
+    global _CHAT_CID
+    _CHAT_CID = None
+    try:
+        reply = chat(rules, message, token)
+    except Exception as e:
+        # still go through the transcript, or a crashed turn would blank the panel's whole
+        # scrollback with one error line. The campaign is the one chat() established, NEVER
+        # read_state(): that file is the previous campaign's dump until a fresh one lands
+        # (audit 2026-10-14 #6). None -> shown for this turn, recorded nowhere.
+        reply = record_turn(_CHAT_CID, load_history(_CHAT_CID), message, f"chat failed ({e}).")
+    # Stamp with the same campaign (lets the mod refuse it at the next boot of a DIFFERENT
+    # campaign, alfred-20261014-stale-chat-mod-fix). A timed-out dump established none, so
+    # that reply goes out UNSTAMPED rather than wearing the stale campaign's stamp (#11).
+    return stamp_reply(reply, _CHAT_CID)
+
+
 def _run_loop(rules):
     print(f"AI General daemon. Exchange: {EXCHANGE}")
     print("ENTER = admin sweep, or click 'AI Sweep' in-game. Ctrl-C quits.")
@@ -5200,6 +5387,7 @@ def _run_loop(rules):
     while True:
         did_sweep = False
         try:
+            poll_executed()  # before any chat/sweep can block the loop
             watch = [sys.stdin] if stdin_live else []
             if watch and select.select(watch, [], [], 1.0)[0]:
                 if sys.stdin.readline() == "":
@@ -5234,22 +5422,7 @@ def _run_loop(rules):
                         last_chat_request = chat_cur  # only advance the baseline on a real act
                         token, message = parsed
                         print("chat requested from in-game HUD popup")
-                        try:
-                            reply = chat(rules, message)
-                        except Exception as e:
-                            # still go through the transcript, or a crashed turn would
-                            # blank the panel's whole scrollback with one error line
-                            # chat() blew up before it could hand us a campaign id, so
-                            # recover it from the state file already on disk — otherwise
-                            # a crashed turn would be recorded against no campaign at all
-                            # (dropped) or, worse, a shared key.
-                            _cid = campaign_id(read_state())
-                            reply = record_turn(_cid, load_history(_cid), message,
-                                                f"chat failed ({e}).")
-                        # chat() just forced a fresh dump, so the state on disk is this
-                        # turn's campaign; the stamp lets the mod refuse it at the next boot
-                        # of a DIFFERENT campaign (alfred-20261014-stale-chat-mod-fix).
-                        reply = stamp_reply(reply, campaign_id(read_state()))
+                        reply = answer_chat(rules, message, token)
                         inplace_write(CHAT_REPLY, token + "\n" + reply + "\n")
         except KeyboardInterrupt:
             print("bye")

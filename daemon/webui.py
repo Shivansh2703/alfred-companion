@@ -116,7 +116,12 @@ def _page(status_ok, status_message, token, error=None, saved=False, notice=None
         cid = str(campaign.get("id") or "")
         label = html.escape(str(campaign.get("label") or cid))
         turn = campaign.get("turn")
-        badge = '<span class="badge">Current snapshot</span>' if campaign.get("current") else ""
+        # "current" only means this campaign wrote the newest dump, not that it is the loaded game
+        ls = campaign.get("last_seen")
+        when = (" " + time.strftime("%Y-%m-%d %H:%M", time.localtime(ls))
+                if isinstance(ls, (int, float)) else "")
+        badge = (f'<span class="badge">Last campaign Alfred saw{html.escape(when)}</span>'
+                 if campaign.get("current") else "")
         current_class = " active" if cid == selected_id else ""
         campaign_links.append(
             f'<a class="campaign{current_class}" href="/?campaign={urllib.parse.quote(cid)}">'

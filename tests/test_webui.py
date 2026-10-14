@@ -116,6 +116,9 @@ class Get(WebUITestCase):
         self.assertIn("Campaigns Alfred knows", body)
         self.assertIn("Yvresse", body)
         self.assertIn("What Alfred knows", body)
+        # #13: the badge must not claim this is the loaded game
+        self.assertIn("Last campaign Alfred saw", body)
+        self.assertNotIn("Current snapshot", body)
         self.assertIn("Recent chat", body)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
         self.assertNotIn("<script>alert(1)</script>", body)
@@ -378,6 +381,36 @@ class DashboardSnapshot(unittest.TestCase):
             self.assertEqual(snapshot["campaigns"][0]["wars"], ["Broken Axe"])
             self.assertEqual(snapshot["selected"]["label"], "Eataine")
             self.assertIn("reserve floor 4000", " ".join(snapshot["campaigns"][0]["context"]))
+
+    def test_same_faction_campaigns_are_told_apart_and_never_merged(self):
+        # #13/#14: two campaigns of one faction (the second possibly a re-minted id after
+        # reloading a pre-first-save game) stay separate and carry id tail + latest turn.
+        with tempfile.TemporaryDirectory() as d:
+            paths = {name: str(Path(d) / filename) for name, filename in {
+                "STATE": "state.json", "CHAT_HISTORY": "chat.json",
+                "JOURNAL": "journal.json", "PREFS": "prefs.json"}.items()}
+            Path(paths["STATE"]).write_text("{}")
+            Path(paths["CHAT_HISTORY"]).write_text("{}")
+            Path(paths["PREFS"]).write_text("{}")
+            Path(paths["JOURNAL"]).write_text(json.dumps({
+                "aaaaaa111111": [{"turn": 3, "faction_name": "Yvresse", "recorded_at": 1}],
+                "bbbbbb222222": [{"turn": 9, "faction_name": "Yvresse", "recorded_at": 2}],
+                "cccccc333333": [{"turn": 5, "faction_name": "Eataine", "recorded_at": 3}],
+            }))
+            with mock.patch.multiple(aigen, **paths), \
+                 mock.patch.object(aigen, "load_model_config", return_value={
+                     "provider": "ollama", "model": "m"}), \
+                 mock.patch.object(aigen, "_stored_api_key", return_value=None), \
+                 mock.patch.object(aigen, "_PROBE", None):
+                snap = aigen.dashboard_snapshot()
+            labels = {c["id"]: c["label"] for c in snap["campaigns"]}
+            self.assertEqual(len(labels), 3)
+            self.assertEqual(len(set(labels.values())), 3)
+            self.assertIn("111111", labels["aaaaaa111111"])
+            self.assertIn("turn 3", labels["aaaaaa111111"])
+            self.assertIn("222222", labels["bbbbbb222222"])
+            self.assertIn("turn 9", labels["bbbbbb222222"])
+            self.assertEqual(labels["cccccc333333"], "Eataine")  # unique faction: unchanged
 
     def test_corrupt_campaign_files_degrade_to_an_empty_dashboard(self):
         with tempfile.TemporaryDirectory() as d:

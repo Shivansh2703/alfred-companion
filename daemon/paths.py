@@ -100,6 +100,43 @@ def game_build_id(manifest_path):
     return m.group(1)
 
 
+def game_version(manifest_path, platform=None):
+    """The game's own version ("9.0.1"), or None if it cannot be read. Never raises.
+    Mac: the app bundle's CFBundleShortVersionString (measured 9.0.1 on build 25937378).
+    Windows: Warhammer3.exe's product version (ASSUMED to carry the same numbers; unmeasured)."""
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            m = re.search(r'"installdir"\s+"([^"]+)"', f.read())
+        game_dir = os.path.join(os.path.dirname(manifest_path), "common", m.group(1))
+        if _plat(platform) == "win32":
+            return _exe_product_version(os.path.join(game_dir, "Warhammer3.exe"))
+        import plistlib
+        for plist in glob.glob(os.path.join(game_dir, "*.app", "Contents", "Info.plist")):
+            with open(plist, "rb") as f:
+                return str(plistlib.load(f)["CFBundleShortVersionString"])
+    except Exception:
+        return None
+    return None
+
+
+def _exe_product_version(exe):
+    import ctypes
+    from ctypes import wintypes
+    ver = ctypes.windll.version
+    size = ver.GetFileVersionInfoSizeW(exe, None)
+    if not size:
+        return None
+    buf = ctypes.create_string_buffer(size)
+    if not ver.GetFileVersionInfoW(exe, 0, size, buf):
+        return None
+    ptr, n = ctypes.c_void_p(), wintypes.UINT()
+    if not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(n)):
+        return None
+    words = ctypes.cast(ptr, ctypes.POINTER(wintypes.DWORD * 13)).contents
+    ms, ls = words[4], words[5]  # VS_FIXEDFILEINFO.dwProductVersionMS / LS
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}"
+
+
 def steam_scripts_dirs(home=None):
     root = os.path.abspath(os.path.expanduser(home or "~"))
     pattern = os.path.join(root, STEAM_SCRIPTS_GLOB)

@@ -12,7 +12,7 @@ _DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
 if _DAEMON_DIR not in sys.path:
     sys.path.insert(0, _DAEMON_DIR)
 from paths import (SetupError, check_setup, companion_manifest, data_dir, discover_exchange_dir,
-                    find_game_manifest, game_build_id, write_exchange_hint)
+                    find_game_manifest, game_build_id, game_version, write_exchange_hint)
 import webui
 
 ROOT = os.path.dirname(_DAEMON_DIR)
@@ -439,9 +439,9 @@ def ready_status():
     if not ok:
         return False, message
     try:
-        expected = _expected_build_id()
-        if expected is not None and expected != game_build_id_live():
-            return False, _build_mismatch_message(expected)
+        verdict, build_message = build_gate(_expected_build_id())
+        if verdict == "refuse":
+            return False, build_message
     except SetupError as e:
         return False, str(e)
     try:
@@ -458,6 +458,8 @@ def ready_status():
         ok_p, msg_p = _PROBE[1], _PROBE[2]
     if not ok_p:
         return False, msg_p
+    if verdict == "warn":
+        return True, "Alfred is ready. Start Warhammer III. Warning: " + build_message
     return True, "Alfred is ready. Start Warhammer III."
 
 # skill display names, e.g. wh2_main_skill_hef_tyrion_army_buff_3 -> "Combined Elites".
@@ -5220,6 +5222,46 @@ def _build_mismatch_message(expected):
             "yet. Download the newest Alfred Companion.")
 
 
+def _built_for_major():
+    """The game's major version this companion was built for (vanilla.lock.json
+    game_major_version), or None if absent/unreadable."""
+    try:
+        with open(os.path.join(ROOT, "vanilla.lock.json"), encoding="utf-8") as f:
+            return str(json.load(f)["game_major_version"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def build_verdict(expected_build, live_build, built_major, live_version):
+    """owner ruling alfred-20261014-major-version-gate: same build -> ok; a different
+    build on the same major game version (or an unreadable version) -> warn and run;
+    a different major -> refuse."""
+    if expected_build is None or expected_build == live_build:
+        return "ok"
+    if built_major is None or not live_version:
+        return "warn"
+    return "warn" if live_version.split(".")[0] == built_major else "refuse"
+
+
+def build_gate(expected_build):
+    """(verdict, message) for this machine's game against the rulebook's build."""
+    if expected_build is None:
+        return "ok", ""
+    live_build = game_build_id_live()
+    if expected_build == live_build:
+        return "ok", ""
+    built_major = _built_for_major()
+    live_version = game_version(find_game_manifest())
+    verdict = build_verdict(expected_build, live_build, built_major, live_version)
+    if verdict == "refuse":
+        return verdict, _build_mismatch_message(expected_build)
+    shown = live_version or "a version Alfred could not read"
+    built = f"{built_major}.x" if built_major else "an earlier version"
+    return verdict, (f"Warhammer III was updated ({shown}); this Alfred Companion was built "
+                     f"for {built}. Alfred still runs, but new or changed buildings and skills "
+                     "may be missing or wrong until the next Alfred Companion.")
+
+
 def _disarm_setup_request():
     """A3: the daemon never reads or applies aigen_setup_request.txt (key entry moved
     to the companion app). Any leftover content from an older build or a stray write is
@@ -5261,15 +5303,18 @@ def _startup():
     every 30s wait-loop retry."""
     bind_exchange(discover_exchange_dir(required=True))
     write_exchange_hint(EXCHANGE)
-    expected = _expected_build_id()
-    if expected is not None and expected != game_build_id_live():
-        raise SetupError(_build_mismatch_message(expected))
+    verdict, build_message = build_gate(_expected_build_id())
+    if verdict == "refuse":
+        raise SetupError(build_message)
     rules = load_rules()
     ensure_exchange_files()
     stamp_legacy_reply()
     _disarm_setup_request()
-    if rules["game_build_id"] != game_build_id_live():
-        raise SetupError(_build_mismatch_message(rules["game_build_id"]))
+    verdict, build_message = build_gate(rules["game_build_id"])
+    if verdict == "refuse":
+        raise SetupError(build_message)
+    if verdict == "warn":
+        print(f"warning: {build_message}")
     return rules
 
 

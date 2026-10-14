@@ -350,6 +350,43 @@ class SslContextTls(unittest.TestCase):
         self.assertIn("/usr/bin/security", calls[0])
 
 
+class MajorVersionGate(unittest.TestCase):
+    """owner ruling alfred-20261014-major-version-gate."""
+
+    def test_verdicts(self):
+        v = aigen.build_verdict
+        self.assertEqual(v("100", "100", "9", "9.0.1"), "ok")
+        self.assertEqual(v("100", "200", "9", "9.0.1"), "warn")
+        self.assertEqual(v("100", "200", "9", "10.0.0"), "refuse")
+        self.assertEqual(v("100", "200", "9", None), "warn")
+        self.assertEqual(v("100", "200", None, "10.0.0"), "warn")
+
+    def test_lock_records_major(self):
+        self.assertEqual(aigen._built_for_major(), "9")
+
+    def test_mac_version_from_app_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _steam_manifest(root)
+            manifest = root / "steamapps" / "appmanifest_1142710.acf"
+            manifest.write_text('"buildid"\t"9001"\n"installdir"\t\t"Game"\n')
+            self.assertIsNone(paths.game_version(str(manifest), platform="darwin"))
+            contents = root / "steamapps" / "common" / "Game" / "G.app" / "Contents"
+            contents.mkdir(parents=True)
+            import plistlib
+            (contents / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "9.0.1"}))
+            self.assertEqual(paths.game_version(str(manifest), platform="darwin"), "9.0.1")
+
+    def test_same_major_runs_with_warning(self):
+        with mock.patch.object(aigen, "game_build_id_live", return_value="200"), \
+             mock.patch.object(aigen, "find_game_manifest", return_value="m"), \
+             mock.patch.object(aigen, "game_version", return_value="9.0.1"), \
+             mock.patch.object(aigen, "_built_for_major", return_value="9"):
+            verdict, message = aigen.build_gate("100")
+        self.assertEqual(verdict, "warn")
+        self.assertIn("9.0.1", message)
+
+
 if __name__ == "__main__":
     unittest.main()
     print("PASS: test_companion_core.py")

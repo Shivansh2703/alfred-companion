@@ -5,6 +5,7 @@
   "rules_path": "data/rules.json",
   "rules_sha256": "5b67a60b0f570d997a4028d5937f548706463b913e11def6a383eeff2f24017f",
   "game_build_id": "25509431",
+  "game_major_version": "9",
   "labels": {
     "path": "data/purpose_labels_vanilla.json",
     "sha256": "63cc46fb8e0be303684142bb157f638e3ee4e687afb3e40e558a3b3ae69f1442",

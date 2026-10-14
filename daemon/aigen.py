@@ -458,8 +458,6 @@ def ready_status():
         ok_p, msg_p = _PROBE[1], _PROBE[2]
     if not ok_p:
         return False, msg_p
-    if verdict == "warn":
-        return True, "Alfred is ready. Start Warhammer III. Warning: " + build_message
     return True, "Alfred is ready. Start Warhammer III."
 
 # skill display names, e.g. wh2_main_skill_hef_tyrion_army_buff_3 -> "Combined Elites".

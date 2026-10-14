@@ -386,6 +386,14 @@ class MajorVersionGate(unittest.TestCase):
         self.assertEqual(verdict, "warn")
         self.assertIn("9.0.1", message)
 
+    def test_same_major_page_shows_no_warning(self):
+        # owner ruling alfred-20261014-remove-version-warning
+        with mock.patch.object(aigen, "check_setup", return_value=(True, "")), \
+             mock.patch.object(aigen, "build_gate", return_value=("warn", "Warhammer III was updated")), \
+             mock.patch.object(aigen, "load_model_config", return_value={"provider": "gemini", "model": "m"}), \
+             mock.patch.object(aigen, "_PROBE", (("gemini", "m"), True, "")):
+            self.assertEqual(aigen.ready_status(), (True, "Alfred is ready. Start Warhammer III."))
+
 
 if __name__ == "__main__":
     unittest.main()

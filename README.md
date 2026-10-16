@@ -1,11 +1,10 @@
 # Alfred Companion
 
 Alfred is an AI administrator for your Total War: WARHAMMER III campaign. The in-game mod
-(installed from Steam Workshop) hands routine settlement building, hero/lord skill points, and
-recruitment for armies you flag as "managed" to an LLM, so you can keep playing the parts you
-care about. Steam Workshop mods cannot make internet calls or store an API key, so this small
-companion app runs on your computer, talks to the model on the mod's behalf, and does nothing
-else.
+(installed from Steam Workshop) hands routine settlement building choices and hero/lord skill
+points to an LLM, so you can keep playing the parts you care about. Steam Workshop mods cannot
+make internet calls or store an API key, so this small companion app runs on your computer,
+talks to the model on the mod's behalf, and does nothing else.
 
 - **What it is**: a background app plus the game mod. Vanilla campaigns only today.
 - **What it needs from you**: a free Gemini API key (or a local Ollama model — no key, nothing
@@ -60,9 +59,9 @@ menu bar icon), then restart the game. If it still doesn't respond, quit and reo
 
 ## After a game update
 
-When Warhammer III updates, Alfred refuses to start until a matching Alfred Companion is
-downloaded, and says so plainly. This is normal — download the newest version from the same
-place you got this one.
+A game update on the same major version (9.x today) keeps working. Alfred shows no warning.
+If Warhammer III moves to a new major version (for example 10), Alfred refuses to start and says
+so plainly. Download the newest Alfred Companion from the same place you got this one.
 
 ## What this is
 
